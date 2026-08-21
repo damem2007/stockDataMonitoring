@@ -1,1 +1,13 @@
--r ../requirements.txt
+fastapi>=0.115
+feedparser>=6.0.11
+numpy>=1.26
+pandas>=2.2
+plotly>=5.22
+psycopg[binary]>=3.2
+python-dotenv>=1.0
+requests>=2.32
+scikit-learn>=1.5
+SQLAlchemy>=2.0
+uvicorn[standard]>=0.30
+vaderSentiment>=3.3.2
+yfinance>=0.2.40
