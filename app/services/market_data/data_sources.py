@@ -9,7 +9,7 @@ import pandas as pd
 import yfinance as yf
 
 
-ROOT = Path(__file__).resolve().parents[4]
+ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = ROOT / "data"
 YAHOO_CACHE_DIR = DATA_DIR / "cache" / "yahoo"
 YAHOO_SNAPSHOT_CACHE_DIR = DATA_DIR / "cache" / "yahoo_snapshot"

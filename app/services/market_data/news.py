@@ -9,9 +9,10 @@ from urllib.parse import quote_plus
 import feedparser
 import pandas as pd
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from backend.app.services.market_data.data_sources import DATA_DIR
 
-ROOT = Path(__file__).resolve().parents[2]
-NEWS_CACHE_DIR = ROOT / "data" / "cache" / "news"
+#ROOT = Path(__file__).resolve().parents[2]
+NEWS_CACHE_DIR = DATA_DIR / "cache" / "news"
 CACHE_TTL_MINUTES = 15
 
 _VADER = SentimentIntensityAnalyzer()

@@ -6,6 +6,7 @@
 
 #### Added
 - Added Yahoo-backed ticker search at `/api/tickers/search`, returning validated ticker suggestions with market, display label, currency, and company name.
+- Added yfinance company-name search candidates to `/api/tickers/search`, so users can search by symbol or company name.
 - Added TSX shorthand support during onboarding, so selecting TSX and entering `CCO` resolves to `CCO.TO`.
 - Added backend ticker validation before persistence so non-existent symbols are rejected instead of saved.
 - Added portfolio-level execution plans for trading holdings.
@@ -14,7 +15,7 @@
 
 #### Changed
 - Changed backend dev port to `8020` to avoid conflicts with the other local backend.
-- Updated backend CORS origins to allow the frontend on `http://localhost:8520` and `http://127.0.0.1:8520`.
+- Changed ticker search market filtering so alternate listings from unrelated exchanges are not returned for selected TSX/NASDAQ/NYSE filters.
 - Changed CORS origin handling so required local frontend origins are merged with configured env origins, preventing stale parent-process env values from blocking the active Next.js dev server.
 - Changed trading onboarding persistence so book cost is calculated from `average purchase price * shares` instead of entered manually.
 - Confirmed this project uses Python only from `/Users/damidahunsi/stockData/backend/.venv`; no root-level Python venv is required.

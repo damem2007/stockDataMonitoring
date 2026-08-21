@@ -5,6 +5,7 @@ from datetime import date
 from typing import Any
 
 import pandas as pd
+import yfinance as yf
 
 from backend.app.services.workspace.alerts import (
     PORTFOLIO_ALERT_SYMBOL,
@@ -111,36 +112,64 @@ def markets_payload() -> dict[str, Any]:
 
 def ticker_search_payload(query: str, markets: list[str] | None = None) -> dict[str, Any]:
     selected = [market.upper() for market in (markets or list(EXCHANGES)) if market.upper() in EXCHANGES]
+    raw_query = str(query or "").strip()
     cleaned = _clean_symbol(query)
-    if not cleaned:
+    if not raw_query or not cleaned:
         return {"results": []}
 
-    candidates: list[tuple[str, str]] = []
+    candidates: list[dict[str, Any]] = []
+
+    def add_candidate(symbol: object, market: str = "", name: str = "", validate: bool = True) -> None:
+        canonical = _clean_symbol(symbol)
+        if not canonical:
+            return
+        resolved_market = market.upper() if market else market_for_symbol(canonical)
+        if not search_market_allowed(resolved_market, selected):
+            return
+        candidates.append(
+            {
+                "symbol": canonical,
+                "market": resolved_market,
+                "name": str(name or "").strip(),
+                "validate": validate,
+            }
+        )
+
     for market in selected:
         for symbol in DEFAULT_WATCHLISTS.get(market, ()):
             if cleaned in symbol.upper():
-                candidates.append((symbol, market))
+                add_candidate(symbol, market, validate=False)
         candidate = normalize_symbol(cleaned, market)
         if candidate:
-            candidates.append((candidate, market))
+            add_candidate(candidate, market, validate=True)
     if not selected:
-        candidates.append((cleaned, ""))
+        add_candidate(cleaned, validate=True)
+
+    for quote in yahoo_search_quotes(raw_query):
+        quote_symbol = quote.get("symbol")
+        quote_market = market_for_search_quote(quote, str(quote_symbol or ""))
+        quote_name = quote.get("shortname") or quote.get("longname") or quote.get("name") or ""
+        add_candidate(quote_symbol, quote_market, str(quote_name), validate=False)
 
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for symbol, market in candidates:
-        canonical = _clean_symbol(symbol)
+    for candidate in candidates:
+        canonical = _clean_symbol(candidate.get("symbol"))
         if canonical in seen:
             continue
-        if not symbol_exists(canonical):
+        if bool(candidate.get("validate")) and not symbol_exists(canonical):
             continue
         seen.add(canonical)
-        snapshot, _status = fetch_yahoo_snapshot(canonical)
-        resolved_market = market or market_for_symbol(canonical)
+        snapshot: dict[str, object] = {}
+        display_name = str(candidate.get("name") or "").strip()
+        if not display_name:
+            snapshot, _status = fetch_yahoo_snapshot(canonical)
+            display_name = str(snapshot.get("shortName") or snapshot.get("longName") or snapshot.get("quoteType") or "").strip()
+        resolved_market = str(candidate.get("market") or "") or market_for_symbol(canonical)
         label_bits = [
             canonical,
             resolved_market,
-            str(snapshot.get("shortName") or snapshot.get("longName") or snapshot.get("quoteType") or "").strip(),
+            display_name,
         ]
         results.append(
             {
@@ -148,12 +177,62 @@ def ticker_search_payload(query: str, markets: list[str] | None = None) -> dict[
                 "market": resolved_market,
                 "label": " | ".join(bit for bit in label_bits if bit),
                 "currency": currency_for_symbol(canonical),
-                "name": snapshot.get("shortName") or snapshot.get("longName") or "",
+                "name": display_name,
             }
         )
         if len(results) >= 8:
             break
     return {"results": results}
+
+
+def yahoo_search_quotes(query: str) -> list[dict[str, Any]]:
+    """Return Yahoo Finance quote search candidates for symbols or company names."""
+
+    search_cls = getattr(yf, "Search", None)
+    if not callable(search_cls):
+        return []
+    try:
+        search = search_cls(
+            query,
+            max_results=12,
+            news_count=0,
+            lists_count=0,
+            include_cb=False,
+            recommended=0,
+            timeout=10,
+            raise_errors=False,
+        )
+    except Exception:
+        return []
+    quotes = getattr(search, "quotes", [])
+    if not isinstance(quotes, list):
+        return []
+    return [quote for quote in quotes if isinstance(quote, dict) and quote.get("symbol")]
+
+
+def market_for_search_quote(quote: dict[str, Any], symbol: str) -> str:
+    cleaned = _clean_symbol(symbol)
+    exchange = str(quote.get("exchange") or quote.get("exchDisp") or "").upper()
+    if cleaned.endswith(".TO") or exchange in {"TOR", "TSX"} or "TORONTO" in exchange:
+        return "TSX"
+    if exchange in {"NMS", "NGM", "NCM", "NAS", "NASDAQ"}:
+        return "NASDAQ"
+    if exchange in {"NYQ", "NYSE", "ASE", "AMEX"}:
+        return "NYSE"
+    if "." in cleaned:
+        return "OTHER"
+    return market_for_symbol(cleaned)
+
+
+def search_market_allowed(market: str, selected: list[str]) -> bool:
+    if not selected:
+        return True
+    normalized = market.upper()
+    if normalized in EXCHANGES:
+        return normalized in selected
+    if normalized == "US":
+        return "NASDAQ" in selected or "NYSE" in selected
+    return not selected
 
 
 def save_instruments(rows: list[dict[str, Any]], user_id: str | None = None) -> list[dict[str, Any]]:
