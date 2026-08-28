@@ -109,9 +109,8 @@ def fetch_yahoo_history(
     cache_path = _cache_path(symbol, period, interval)
 
     if cache_path.exists() and not refresh:
-        frame = pd.read_csv(cache_path, parse_dates=["Date"])
-        prepared = _prepare_history(frame)
-        if history_cache_is_fresh(prepared, interval):
+        prepared = _read_history_cache(cache_path, interval)
+        if prepared is not None and history_cache_is_fresh(prepared, interval):
             return prepared, SourceStatus("Yahoo Finance cache", str(cache_path))
 
     ticker = yf.Ticker(symbol)
@@ -119,12 +118,13 @@ def fetch_yahoo_history(
         frame = ticker.history(period=period, interval=interval, auto_adjust=False)
     except Exception as exc:
         if cache_path.exists():
-            cached = pd.read_csv(cache_path, parse_dates=["Date"])
-            return _prepare_history(cached), SourceStatus(
-                "Yahoo Finance cache",
-                f"Live fetch failed ({type(exc).__name__}); using cached file {cache_path}",
-                ok=False,
-            )
+            cached = _read_history_cache(cache_path, interval)
+            if cached is not None:
+                return cached, SourceStatus(
+                    "Yahoo Finance cache",
+                    f"Live fetch failed ({type(exc).__name__}); using cached file {cache_path}",
+                    ok=False,
+                )
         return pd.DataFrame(), SourceStatus(
             "Yahoo Finance",
             f"Live fetch failed: {type(exc).__name__}: {exc}",
@@ -132,12 +132,13 @@ def fetch_yahoo_history(
         )
     if frame.empty:
         if cache_path.exists():
-            cached = pd.read_csv(cache_path, parse_dates=["Date"])
-            return _prepare_history(cached), SourceStatus(
-                "Yahoo Finance cache",
-                f"Live fetch empty; using cached file {cache_path}",
-                ok=False,
-            )
+            cached = _read_history_cache(cache_path, interval)
+            if cached is not None:
+                return cached, SourceStatus(
+                    "Yahoo Finance cache",
+                    f"Live fetch empty; using cached file {cache_path}",
+                    ok=False,
+                )
         return pd.DataFrame(), SourceStatus("Yahoo Finance", "No data returned", ok=False)
 
     frame = frame.reset_index()
@@ -162,6 +163,21 @@ def fetch_yahoo_history(
         "Yahoo Finance",
         f"Fetched {len(frame):,} rows at {datetime.now(timezone.utc).isoformat()}",
     )
+
+
+def _read_history_cache(cache_path: Path, interval: str) -> pd.DataFrame | None:
+    try:
+        frame = pd.read_csv(cache_path, parse_dates=["Date"])
+        prepared = _prepare_history(frame)
+        if history_is_plausible(prepared, interval):
+            return prepared
+    except Exception:
+        pass
+    try:
+        cache_path.unlink()
+    except Exception:
+        pass
+    return None
 
 
 def fetch_yahoo_quote(symbol: str) -> tuple[dict[str, object], SourceStatus]:

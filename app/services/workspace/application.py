@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import asdict, is_dataclass
 from datetime import date
 from typing import Any
@@ -7,6 +8,11 @@ from typing import Any
 import pandas as pd
 import yfinance as yf
 
+from sqlalchemy import select
+
+from backend.app.database import database_available, ensure_database, session_scope
+from backend.app.models.orm import AppUser, InstrumentTag, PortfolioAccount, PortfolioActivity
+from backend.app.schemas.roles import InstrumentRole
 from backend.app.services.workspace.alerts import (
     PORTFOLIO_ALERT_SYMBOL,
     create_alert,
@@ -265,6 +271,10 @@ def save_onboarding(
     normalized, errors = normalize_onboarding_rows(rows, exchange, role)
     if errors:
         raise ValueError("; ".join(errors))
+    if role == InstrumentRole.trading.value and store_user_id and database_available() and ensure_database():
+        for row in normalized:
+            add_portfolio_activity(store_user_id, row, activity_type="BUY")
+        return read_instrument_tags(user_id=store_user_id)
     existing = read_instrument_tags(user_id=store_user_id)
     by_symbol = {str(row.get("symbol", "")).upper(): row for row in existing}
     for row in normalized:
@@ -338,9 +348,10 @@ def focused_analysis_payload(
     if frame.empty:
         return {"symbol": normalized_symbol, "ok": False, "status": source_status, "history": []}
 
-    news = fetch_news(normalized_symbol, refresh=refresh)
-    sentiment = news_sentiment_score(news)
     snapshot, snapshot_status = fetch_yahoo_snapshot(normalized_symbol, refresh=refresh)
+    company_name = str(snapshot.get("longName") or snapshot.get("shortName") or "")
+    news = fetch_news(normalized_symbol, company_name=company_name, refresh=refresh)
+    sentiment = news_sentiment_score(news)
     earnings, earnings_status = fetch_earnings_calendar(normalized_symbol, refresh=refresh)
     enriched_snapshot = enrich_snapshot_with_earnings(snapshot, earnings)
     risk_profile = get_risk_profile(risk_profile_name)
@@ -416,16 +427,246 @@ def portfolio_payload(
     for symbol in active_symbols(rows):
         frame, _status = load_analysis_frame(symbol, period=period, interval=interval, refresh=refresh)
         histories[symbol] = frame
-    portfolio = build_portfolio_table(trading_instruments(rows), histories)
+    live_histories = {}
+    for symbol in active_symbols(rows):
+        live_frame, _status = fetch_yahoo_history(symbol, period="5d", interval="5m", refresh=refresh)
+        live_histories[symbol] = live_frame
+    portfolio = build_portfolio_table(trading_instruments(rows), histories, live_histories)
     category = category_exposure_table(portfolio)
-    watchlist = build_watchlist_table(rows, histories)
+    watchlist = build_watchlist_table(rows, histories, live_histories)
+    account = portfolio_account_payload(store_user_id)
     return {
+        "account": account,
         "portfolio": frame_to_records(portfolio),
         "categoryExposure": frame_to_records(category),
         "watchlist": frame_to_records(watchlist),
+        "activities": list_portfolio_activities(store_user_id),
         "metrics": portfolio_metrics(portfolio),
         "notes": portfolio_recommendations(portfolio, category),
         "executionPlans": portfolio_execution_plans(trading_instruments(rows), histories),
+    }
+
+
+def portfolio_account_payload(user_id: str | None) -> dict[str, Any] | None:
+    if not user_id or not database_available() or not ensure_database():
+        return None
+    with session_scope() as session:
+        account = ensure_default_portfolio(session, user_id)
+        return {
+            "id": str(account.id),
+            "name": account.name,
+            "accountType": account.account_type,
+            "currency": account.currency,
+            "active": account.active,
+        }
+
+
+def add_portfolio_activity(
+    user_id: str,
+    row: dict[str, Any],
+    activity_type: str = "BUY",
+    note: str = "",
+) -> dict[str, Any]:
+    if not database_available() or not ensure_database():
+        raise RuntimeError("Database storage is required for portfolio activity.")
+    symbol = _clean_symbol(row.get("symbol"))
+    if not symbol:
+        raise ValueError("Ticker symbol is required.")
+    with session_scope() as session:
+        account = ensure_default_portfolio(session, user_id)
+        activity = PortfolioActivity(
+            user_id=_uuid(user_id),
+            portfolio_id=account.id,
+            symbol=symbol,
+            activity_type=activity_type.upper(),
+            trade_date=_date_or_today(row.get("purchase_date") or row.get("trade_date")),
+            shares=_safe_nonnegative(row.get("shares")),
+            price=_safe_nonnegative(row.get("average_cost") or row.get("price")),
+            amount=_safe_nonnegative(row.get("book_cost") or row.get("amount")),
+            fees=_safe_nonnegative(row.get("fees")),
+            status=str(row.get("status") or "Completed"),
+            note=str(note or row.get("notes") or row.get("note") or ""),
+        )
+        if float(activity.amount or 0) <= 0 and float(activity.shares or 0) > 0 and float(activity.price or 0) > 0:
+            activity.amount = float(activity.shares) * float(activity.price) + float(activity.fees or 0)
+        session.add(activity)
+        session.flush()
+        recompute_holding_from_activities(session, user_id, symbol, row)
+        return activity_to_payload(activity)
+
+
+def close_portfolio_holding(user_id: str, symbol: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if not database_available() or not ensure_database():
+        raise RuntimeError("Database storage is required for portfolio activity.")
+    normalized = _clean_symbol(symbol)
+    activity_type = str(payload.get("action") or payload.get("activity_type") or "").strip().upper()
+    if activity_type not in {"TRANSFER", "LIQUIDATE"}:
+        raise ValueError("Choose either Transfer or Liquidate.")
+    shares = _safe_nonnegative(payload.get("shares"))
+    with session_scope() as session:
+        account = ensure_default_portfolio(session, user_id)
+        current = current_position_from_activities(session, user_id, normalized)
+        current_shares = float(current["shares"])
+        if current_shares <= 0:
+            raise ValueError(f"{normalized} is not an active portfolio holding.")
+        quantity = current_shares if shares <= 0 else min(shares, current_shares)
+        note = str(payload.get("note") or "").strip()
+        price = _safe_nonnegative(payload.get("selling_price") or payload.get("price"))
+        if activity_type == "TRANSFER" and not note:
+            raise ValueError("Transfer requires a note.")
+        if activity_type == "LIQUIDATE" and price <= 0:
+            raise ValueError("Liquidation requires a selling price.")
+        realized = (price - float(current["average_cost"])) * quantity if activity_type == "LIQUIDATE" else 0.0
+        activity = PortfolioActivity(
+            user_id=_uuid(user_id),
+            portfolio_id=account.id,
+            symbol=normalized,
+            activity_type=activity_type,
+            trade_date=_date_or_today(payload.get("trade_date")),
+            shares=quantity,
+            price=price,
+            amount=quantity * price,
+            fees=_safe_nonnegative(payload.get("fees")),
+            status="Completed",
+            note=note,
+            realized_pl=realized,
+        )
+        session.add(activity)
+        session.flush()
+        recompute_holding_from_activities(session, user_id, normalized, {})
+        return activity_to_payload(activity)
+
+
+def list_portfolio_activities(user_id: str | None, symbol: str | None = None) -> list[dict[str, Any]]:
+    if not user_id or not database_available() or not ensure_database():
+        return []
+    with session_scope() as session:
+        query = select(PortfolioActivity).where(PortfolioActivity.user_id == _uuid(user_id))
+        if symbol:
+            query = query.where(PortfolioActivity.symbol == _clean_symbol(symbol))
+        rows = session.execute(query.order_by(PortfolioActivity.trade_date.desc(), PortfolioActivity.created_at.desc())).scalars().all()
+        return [activity_to_payload(row) for row in rows]
+
+
+def rename_default_portfolio(user_id: str, name: str) -> dict[str, Any]:
+    if not database_available() or not ensure_database():
+        raise RuntimeError("Database storage is required for portfolio management.")
+    cleaned = str(name or "").strip()
+    if not cleaned:
+        raise ValueError("Portfolio name is required.")
+    with session_scope() as session:
+        account = ensure_default_portfolio(session, user_id)
+        account.name = cleaned
+        session.flush()
+        return {
+            "id": str(account.id),
+            "name": account.name,
+            "accountType": account.account_type,
+            "currency": account.currency,
+            "active": account.active,
+        }
+
+
+def ensure_default_portfolio(session: Any, user_id: str) -> PortfolioAccount:
+    parsed_user_id = _uuid(user_id)
+    account = session.execute(
+        select(PortfolioAccount)
+        .where(PortfolioAccount.user_id == parsed_user_id, PortfolioAccount.active.is_(True))
+        .order_by(PortfolioAccount.created_at)
+        .limit(1)
+    ).scalar_one_or_none()
+    if account:
+        return account
+    user = session.get(AppUser, parsed_user_id)
+    display = str(getattr(user, "full_name", "") or getattr(user, "username", "") or "My").strip()
+    suffix = "'" if display.endswith("s") else "'s"
+    account = PortfolioAccount(user_id=parsed_user_id, name=f"{display}{suffix} portfolio", currency="CAD")
+    session.add(account)
+    session.flush()
+    return account
+
+
+def current_position_from_activities(session: Any, user_id: str, symbol: str) -> dict[str, Any]:
+    activities = session.execute(
+        select(PortfolioActivity)
+        .where(PortfolioActivity.user_id == _uuid(user_id), PortfolioActivity.symbol == _clean_symbol(symbol))
+        .order_by(PortfolioActivity.trade_date, PortfolioActivity.created_at)
+    ).scalars().all()
+    shares = 0.0
+    book_cost = 0.0
+    first_purchase = ""
+    realized = 0.0
+    for activity in activities:
+        activity_type = str(activity.activity_type or "").upper()
+        quantity = float(activity.shares or 0)
+        price = float(activity.price or 0)
+        amount = float(activity.amount or 0)
+        if activity_type in {"BUY", "ADD", "TRANSFER_IN"}:
+            if not first_purchase:
+                first_purchase = activity.trade_date.isoformat()
+            shares += quantity
+            book_cost += amount if amount > 0 else quantity * price
+        elif activity_type in {"LIQUIDATE", "SELL", "TRANSFER"}:
+            if shares <= 0:
+                continue
+            closing_qty = min(quantity, shares)
+            average_cost = book_cost / shares if shares > 0 else 0.0
+            if activity_type in {"LIQUIDATE", "SELL"}:
+                realized += (price - average_cost) * closing_qty
+            shares -= closing_qty
+            book_cost -= average_cost * closing_qty
+    return {
+        "shares": max(shares, 0.0),
+        "book_cost": max(book_cost, 0.0),
+        "average_cost": book_cost / shares if shares > 0 else 0.0,
+        "purchase_date": first_purchase,
+        "realized_pl": realized,
+    }
+
+
+def recompute_holding_from_activities(session: Any, user_id: str, symbol: str, preferences: dict[str, Any]) -> None:
+    parsed_user_id = _uuid(user_id)
+    normalized = _clean_symbol(symbol)
+    position = current_position_from_activities(session, user_id, normalized)
+    tag = session.execute(
+        select(InstrumentTag).where(InstrumentTag.user_id == parsed_user_id, InstrumentTag.symbol == normalized)
+    ).scalar_one_or_none()
+    if not tag:
+        tag = InstrumentTag(user_id=parsed_user_id, symbol=normalized, role="Trading")
+        session.add(tag)
+    tag.role = "Trading"
+    tag.active = float(position["shares"]) > 0
+    tag.shares = float(position["shares"])
+    tag.book_cost = float(position["book_cost"])
+    tag.average_cost = float(position["average_cost"])
+    tag.purchase_date = _date_or_none(position["purchase_date"])
+    if _has_value(preferences.get("intent")):
+        tag.intent = str(preferences.get("intent"))
+    elif not tag.intent:
+        tag.intent = "Hold / Watch"
+    if _has_value(preferences.get("strategy")):
+        tag.strategy = str(preferences.get("strategy"))
+    elif not tag.strategy:
+        tag.strategy = "Buy-dip"
+    if _has_value(preferences.get("notes")):
+        tag.notes = str(preferences.get("notes"))
+
+
+def activity_to_payload(activity: PortfolioActivity) -> dict[str, Any]:
+    return {
+        "id": str(activity.id),
+        "portfolioId": str(activity.portfolio_id),
+        "symbol": activity.symbol,
+        "activityType": activity.activity_type,
+        "tradeDate": activity.trade_date.isoformat(),
+        "shares": float(activity.shares or 0),
+        "price": float(activity.price or 0),
+        "amount": float(activity.amount or 0),
+        "fees": float(activity.fees or 0),
+        "status": activity.status,
+        "note": activity.note,
+        "realizedPl": float(activity.realized_pl or 0),
+        "createdAt": activity.created_at.isoformat() if activity.created_at else "",
     }
 
 
@@ -645,11 +886,16 @@ def strategy_model_horizon_days(horizon: str) -> int:
     return 15
 
 
-def build_portfolio_table(trading_rows: list[dict[str, object]], histories: dict[str, pd.DataFrame]) -> pd.DataFrame:
+def build_portfolio_table(
+    trading_rows: list[dict[str, object]],
+    histories: dict[str, pd.DataFrame],
+    live_histories: dict[str, pd.DataFrame] | None = None,
+) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for item in trading_rows:
         symbol = str(item.get("symbol", "")).strip().upper()
         frame = histories.get(symbol, pd.DataFrame())
+        live_frame = (live_histories or {}).get(symbol, pd.DataFrame())
         shares = _safe_nonnegative(item.get("shares"))
         average_cost = _safe_nonnegative(item.get("average_cost"))
         book_cost = _safe_nonnegative(item.get("book_cost"))
@@ -664,7 +910,8 @@ def build_portfolio_table(trading_rows: list[dict[str, object]], histories: dict
         if shares <= 0 or frame.empty:
             continue
 
-        price = latest_close(frame)
+        pricing_frame = live_frame if not live_frame.empty else frame
+        price = latest_close(pricing_frame)
         prev_close = previous_close(frame, 1)
         week_close = previous_close(frame, 5)
         market_value = shares * price
@@ -691,6 +938,7 @@ def build_portfolio_table(trading_rows: list[dict[str, object]], histories: dict
                 "Week %": week_pct,
                 "Since Purchase $": since_purchase,
                 "Since Purchase %": since_purchase_pct,
+                "Trend": portfolio_trend(pricing_frame, shares),
                 "Notes": str(item.get("notes") or ""),
             }
         )
@@ -703,14 +951,20 @@ def build_portfolio_table(trading_rows: list[dict[str, object]], histories: dict
     return table.sort_values("Market Value", ascending=False).reset_index(drop=True)
 
 
-def build_watchlist_table(rows: list[dict[str, Any]], histories: dict[str, pd.DataFrame]) -> pd.DataFrame:
+def build_watchlist_table(
+    rows: list[dict[str, Any]],
+    histories: dict[str, pd.DataFrame],
+    live_histories: dict[str, pd.DataFrame] | None = None,
+) -> pd.DataFrame:
     output = []
     for item in rows:
         if str(item.get("role") or "").strip().title() != "Watching" or not bool(item.get("active", True)):
             continue
         symbol = str(item.get("symbol", "")).upper()
         frame = histories.get(symbol, pd.DataFrame())
-        current = latest_close(frame) if not frame.empty else float("nan")
+        live_frame = (live_histories or {}).get(symbol, pd.DataFrame())
+        pricing_frame = live_frame if not live_frame.empty else frame
+        current = latest_close(pricing_frame) if not pricing_frame.empty else float("nan")
         prev = previous_close(frame, 1) if not frame.empty else float("nan")
         week = previous_close(frame, 5) if not frame.empty else float("nan")
         output.append(
@@ -723,9 +977,24 @@ def build_watchlist_table(rows: list[dict[str, Any]], histories: dict[str, pd.Da
                 "Current Price": current,
                 "Today %": current / prev - 1 if current == current and prev == prev and prev > 0 else float("nan"),
                 "Week %": current / week - 1 if current == current and week == week and week > 0 else float("nan"),
+                "Trend": watchlist_trend(pricing_frame),
             }
         )
     return pd.DataFrame(output)
+
+
+def watchlist_trend(frame: pd.DataFrame, points: int = 18) -> list[float]:
+    if frame.empty or "Close" not in frame.columns:
+        return []
+    values = pd.to_numeric(frame["Close"], errors="coerce").dropna().tail(points)
+    return [float(value) for value in values]
+
+
+def portfolio_trend(frame: pd.DataFrame, shares: float, points: int = 18) -> list[float]:
+    if frame.empty or "Close" not in frame.columns or shares <= 0:
+        return []
+    values = pd.to_numeric(frame["Close"], errors="coerce").dropna().tail(points)
+    return [float(value) * shares for value in values]
 
 
 def portfolio_metrics(portfolio: pd.DataFrame) -> dict[str, Any]:
@@ -774,9 +1043,10 @@ def portfolio_execution_plans(trading_rows: list[dict[str, object]], histories: 
         benchmark_symbol, _benchmark_name = benchmark_for_symbol(symbol)
         benchmark = histories.get(benchmark_symbol, pd.DataFrame())
         regime = market_regime(benchmark if not benchmark.empty else frame, profile=risk_profile)
-        news = fetch_news(symbol)
-        sentiment = news_sentiment_score(news)
         snapshot, _snapshot_status = fetch_yahoo_snapshot(symbol)
+        company_name = str(snapshot.get("longName") or snapshot.get("shortName") or "")
+        news = fetch_news(symbol, company_name=company_name)
+        sentiment = news_sentiment_score(news)
         earnings, _earnings_status = fetch_earnings_calendar(symbol)
         signal = build_signal(
             symbol,
@@ -795,7 +1065,7 @@ def portfolio_execution_plans(trading_rows: list[dict[str, object]], histories: 
             {
                 "symbol": symbol,
                 "action": signal.action,
-                "score": signal.score,
+                "score": signal.confidence,
                 "setup": signal.setup,
                 "entryZone": signal.entry_zone,
                 "exitZone": signal.exit_zone,
@@ -925,3 +1195,22 @@ def _safe_nonnegative(value: object) -> float:
     if number != number:
         return 0.0
     return max(number, 0.0)
+
+
+def _uuid(value: object) -> uuid.UUID:
+    return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+
+
+def _date_or_today(value: object) -> date:
+    return _date_or_none(value) or date.today()
+
+
+def _date_or_none(value: object) -> date | None:
+    if not value:
+        return None
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError:
+        return None

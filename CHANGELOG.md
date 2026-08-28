@@ -1,10 +1,38 @@
 # Changelog
 
+## 2026-08-28
+
+### Backend
+
+#### Added
+- Added named portfolio accounts so a user can maintain a portfolio such as `Dami's portfolio` instead of treating onboarding as the dashboard itself.
+- Added `portfolio_activities` persistence for buy/add, transfer, and liquidation events.
+- Added portfolio activity APIs for adding purchase lots, listing activity history, renaming the portfolio, and disposing of holdings through transfer or liquidation.
+- Added account registration, profile update, password update, subscription summary, and invoice endpoints for signed-in users.
+- Added portfolio position trend data based on recent close prices multiplied by held shares for dynamic holding mini charts.
+- Added in-process guest symbol registration so guest-local watchlist symbols are warmed by the backend refresh loop after the first guest sync.
+
+#### Changed
+- Changed trading onboarding persistence so each new holding row records a buy activity and rolls up into the current position snapshot.
+- Changed the background refresh service to read `REFRESH_INTERVAL_SECOND` as well as `REFRESH_INTERVAL_SECONDS`.
+- Changed refresh behavior to dedupe active symbols across all persisted users before Yahoo/cache calls, avoiding both per-user duplicate refreshes and whole-market scans.
+- Changed the backend refresh loop to actively refresh 5-minute and daily history for the deduped active universe, so watchlist and portfolio mini charts can update while only the venv server is running.
+
+#### Fixed
+- Fixed Python 3.9/Pydantic compatibility for newly added account and portfolio request schemas.
+- Fixed FastAPI startup compatibility after adding the account and portfolio activity routes.
+- Fixed logged-in correlation 500s caused by malformed Yahoo history CSV cache files; corrupt caches are now discarded and refetched or ignored instead of raising a Pandas parser error.
+- Fixed the analysis API period validation so the frontend `YTD` chart range can request Yahoo's `ytd` period without being rejected.
+
 ## 2026-08-20
 
 ### Backend
 
 #### Added
+- Added an application-scope workspace refresh service that warms active persisted instruments every 30 seconds without removing the manual `Sync Workspace` action.
+- Added `/api/workspace/sync` for scoped watchlist/portfolio refreshes, including guest-local instrument lists sent from the frontend.
+- Added RBAC permission groups for account profile, email, security, preferences, subscription, billing, invoices, real-time analysis, and buy/sell chart indicator capabilities.
+- Added temp guest JWT session support with analysis/watchlist permissions but no portfolio persistence permission.
 - Added Yahoo-backed ticker search at `/api/tickers/search`, returning validated ticker suggestions with market, display label, currency, and company name.
 - Added yfinance company-name search candidates to `/api/tickers/search`, so users can search by symbol or company name.
 - Added TSX shorthand support during onboarding, so selecting TSX and entering `CCO` resolves to `CCO.TO`.
@@ -14,6 +42,10 @@
 - Added `backend/run_api.sh` to start the FastAPI backend on port `8020`.
 
 #### Changed
+- Changed per-symbol news fetching to use Yahoo Finance and Google News queries tied to the selected symbol/company name instead of market-wide generic feeds.
+- Changed news sentiment fallback so generic or unmatched headlines no longer influence an instrument score.
+- Changed news caching to use a schema version so stale market-wide cache rows are ignored after the symbol-specific filter change.
+- Changed portfolio and watchlist sync payloads to include computed watchlist trend data for frontend mini charts.
 - Changed backend dev port to `8020` to avoid conflicts with the other local backend.
 - Changed ticker search market filtering so alternate listings from unrelated exchanges are not returned for selected TSX/NASDAQ/NYSE filters.
 - Changed CORS origin handling so required local frontend origins are merged with configured env origins, preventing stale parent-process env values from blocking the active Next.js dev server.
@@ -23,6 +55,9 @@
 - Changed the bootstrapped local root account role from `admin` to `superadmin` to match the system actor model.
 
 #### Fixed
+- Fixed FastAPI route annotation compatibility with the Python 3.9 backend venv for `uvicorn app.main:app`.
+- Fixed false-positive news matching for short TSX symbols so unrelated TD ETF, AT&T, or broad market headlines are rejected unless they match exchange-qualified ticker/company aliases.
+- Fixed RBAC role normalization so legacy `auth_user` maps to the current `user` actor while `guest`, `user`, `admin`, and `superadmin` remain explicit.
 - Fixed `backend/.venv` activation metadata so `source .venv/bin/activate` from the backend folder points to `backend/.venv`.
 - Fixed `uvicorn app.main:app --reload` startup from inside the backend folder.
 - Fixed FastAPI imports so `app.main:app` works when launched from the `backend` directory.

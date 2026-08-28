@@ -12,9 +12,11 @@ from typing import Any
 
 from dotenv import load_dotenv
 from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError
 
 from backend.app.database import database_available, ensure_database, session_scope
 from backend.app.models.orm import AppUser
+from backend.app.services.rbac import normalize_role, permissions_for_role
 
 
 load_dotenv()
@@ -29,15 +31,22 @@ class AuthUser:
     username: str
     name: str
     role: str = "user"
+    permissions: tuple[str, ...] = ()
+    is_guest: bool = False
 
-    def as_dict(self) -> dict[str, str]:
+    def as_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "email": self.email,
             "username": self.username,
             "name": self.name,
             "role": self.role,
+            "permissions": list(self.permissions or sorted(permissions_for_role(self.role))),
+            "isGuest": self.is_guest,
         }
+
+    def has_permission(self, permission: str) -> bool:
+        return permission in set(self.permissions or sorted(permissions_for_role(self.role)))
 
 
 def authenticate_user(login: str, password: str) -> AuthUser | None:
@@ -48,34 +57,103 @@ def authenticate_user(login: str, password: str) -> AuthUser | None:
         bootstrap_local_root_user()
         user = find_user(login)
         if user and verify_password(password, str(user["password_hash"])):
-            return AuthUser(
-                id=str(user["id"]),
-                email=str(user["email"]),
-                username=str(user["username"]),
-                name=str(user["full_name"] or user["username"]),
-                role=str(user["role"] or "user"),
-            )
+            return auth_user_from_row(user)
         return None
     return authenticate_local_root(login, password)
 
 
-def default_storage_user_id() -> str | None:
-    login = os.getenv("LOCAL_ROOT_EMAIL", "").strip().lower() or os.getenv("LOCAL_ROOT_USERNAME", "").strip().lower()
-    if not login or not (database_available() and ensure_database()):
-        return None
-    bootstrap_local_root_user()
-    user = find_user(login)
-    return str(user["id"]) if user else None
+def register_user(email: str, username: str, full_name: str, password: str) -> AuthUser:
+    if not database_available() or not ensure_database():
+        raise RuntimeError("Database storage is required for account registration.")
+    normalized_email = email.strip().lower()
+    normalized_username = username.strip().lower()
+    if not normalized_email or "@" not in normalized_email:
+        raise ValueError("A valid email is required.")
+    if not normalized_username:
+        raise ValueError("Username is required.")
+    if len(password) < 8:
+        raise ValueError("Password must be at least 8 characters.")
+    with session_scope() as session:
+        exists = session.execute(
+            select(AppUser).where(or_(AppUser.email == normalized_email, AppUser.username == normalized_username))
+        ).scalar_one_or_none()
+        if exists:
+            raise ValueError("An account with that email or username already exists.")
+        user = AppUser(
+            email=normalized_email,
+            username=normalized_username,
+            full_name=full_name.strip() or normalized_username,
+            password_hash=hash_password(password),
+            role="user",
+        )
+        session.add(user)
+        try:
+            session.flush()
+        except IntegrityError as exc:
+            raise ValueError("An account with that email or username already exists.") from exc
+        return auth_user_from_model(user)
+
+
+def update_user_profile(user_id: str, email: str | None = None, username: str | None = None, full_name: str | None = None) -> AuthUser:
+    if not database_available() or not ensure_database():
+        raise RuntimeError("Database storage is required for account management.")
+    with session_scope() as session:
+        user = session.get(AppUser, _uuid(user_id))
+        if not user:
+            raise ValueError("Account was not found.")
+        if email is not None:
+            normalized_email = email.strip().lower()
+            if not normalized_email or "@" not in normalized_email:
+                raise ValueError("A valid email is required.")
+            user.email = normalized_email
+        if username is not None:
+            normalized_username = username.strip().lower()
+            if not normalized_username:
+                raise ValueError("Username is required.")
+            user.username = normalized_username
+        if full_name is not None:
+            user.full_name = full_name.strip()
+        try:
+            session.flush()
+        except IntegrityError as exc:
+            raise ValueError("An account with that email or username already exists.") from exc
+        return auth_user_from_model(user)
+
+
+def change_user_password(user_id: str, current_password: str, new_password: str) -> None:
+    if not database_available() or not ensure_database():
+        raise RuntimeError("Database storage is required for account management.")
+    if len(new_password) < 8:
+        raise ValueError("New password must be at least 8 characters.")
+    with session_scope() as session:
+        user = session.get(AppUser, _uuid(user_id))
+        if not user:
+            raise ValueError("Account was not found.")
+        if not verify_password(current_password, user.password_hash):
+            raise ValueError("Current password is incorrect.")
+        user.password_hash = hash_password(new_password)
+
+
+def create_guest_user() -> AuthUser:
+    guest_id = f"guest-{secrets.token_urlsafe(12)}"
+    return AuthUser(
+        id=guest_id,
+        email="guest@local",
+        username="guest",
+        name="Guest",
+        role="guest",
+        permissions=tuple(sorted(permissions_for_role("guest"))),
+        is_guest=True,
+    )
 
 
 def bootstrap_local_root_user() -> None:
-    email = os.getenv("LOCAL_ROOT_EMAIL", "").strip().lower()
-    username = os.getenv("LOCAL_ROOT_USERNAME", "").strip().lower()
+    email = os.getenv("LOCAL_ROOT_EMAIL", "root@stockdata.local").strip().lower()
+    username = os.getenv("LOCAL_ROOT_USERNAME", "root").strip().lower()
     password = os.getenv("LOCAL_ROOT_PASSWORD", "")
     name = os.getenv("LOCAL_ROOT_NAME", "Local Root Administrator").strip()
     if not (email and username and password and database_available()):
         return
-    password_hash = hash_password(password)
     with session_scope() as session:
         existing = session.execute(
             select(AppUser).where(or_(AppUser.email == email, AppUser.username == username))
@@ -84,7 +162,7 @@ def bootstrap_local_root_user() -> None:
             existing.email = email
             existing.username = username
             existing.full_name = name
-            existing.password_hash = password_hash
+            existing.password_hash = hash_password(password)
             existing.role = "superadmin"
         else:
             session.add(
@@ -92,7 +170,7 @@ def bootstrap_local_root_user() -> None:
                     email=email,
                     username=username,
                     full_name=name,
-                    password_hash=password_hash,
+                    password_hash=hash_password(password),
                     role="superadmin",
                 )
             )
@@ -116,8 +194,8 @@ def find_user(login: str) -> dict[str, Any] | None:
 
 
 def authenticate_local_root(login: str, password: str) -> AuthUser | None:
-    email = os.getenv("LOCAL_ROOT_EMAIL", "").strip().lower()
-    username = os.getenv("LOCAL_ROOT_USERNAME", "").strip().lower()
+    email = os.getenv("LOCAL_ROOT_EMAIL", "root@stockdata.local").strip().lower()
+    username = os.getenv("LOCAL_ROOT_USERNAME", "root").strip().lower()
     expected_password = os.getenv("LOCAL_ROOT_PASSWORD", "")
     if not (expected_password and (login == email or login == username)):
         return None
@@ -125,15 +203,40 @@ def authenticate_local_root(login: str, password: str) -> AuthUser | None:
         return None
     return AuthUser(
         id="local-root",
-        email=email or "root@local",
-        username=username or "root",
+        email=email,
+        username=username,
         name=os.getenv("LOCAL_ROOT_NAME", "Local Root Administrator"),
         role="superadmin",
+        permissions=tuple(sorted(permissions_for_role("superadmin"))),
     )
 
 
-def hash_password(password: str, salt: str | None = None) -> str:
-    salt = salt or secrets.token_hex(16)
+def auth_user_from_row(row: dict[str, Any]) -> AuthUser:
+    role = normalize_role(str(row.get("role") or "user"))
+    return AuthUser(
+        id=str(row["id"]),
+        email=str(row["email"]),
+        username=str(row["username"]),
+        name=str(row.get("full_name") or row["username"]),
+        role=role,
+        permissions=tuple(sorted(permissions_for_role(role))),
+    )
+
+
+def auth_user_from_model(user: AppUser) -> AuthUser:
+    return auth_user_from_row(
+        {
+            "id": user.id,
+            "email": user.email,
+            "username": user.username,
+            "full_name": user.full_name,
+            "role": user.role,
+        }
+    )
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
     digest = hashlib.pbkdf2_hmac(
         "sha256",
         password.encode("utf-8"),
@@ -161,23 +264,23 @@ def verify_password(password: str, stored_hash: str) -> bool:
     return hmac.compare_digest(digest, expected)
 
 
-def token_expiry() -> datetime:
-    minutes = int(os.getenv("JWT_ACCESS_TOKEN_MINUTES", "60") or "60")
-    return datetime.now(timezone.utc) + timedelta(minutes=minutes)
-
-
 def create_access_token(user: AuthUser) -> str:
     now = datetime.now(timezone.utc)
+    expires = now + timedelta(minutes=token_minutes(user))
     payload = {
         "sub": user.id,
         "email": user.email,
         "username": user.username,
         "name": user.name,
         "role": user.role,
+        "permissions": list(user.permissions or sorted(permissions_for_role(user.role))),
+        "guest": user.is_guest,
         "iss": os.getenv("JWT_ISSUER", "stock-signal-local"),
         "aud": os.getenv("JWT_AUDIENCE", "stock-signal-api"),
         "iat": int(now.timestamp()),
-        "exp": int(token_expiry().timestamp()),
+        "nbf": int(now.timestamp()),
+        "exp": int(expires.timestamp()),
+        "jti": secrets.token_urlsafe(16),
     }
     header = {"alg": os.getenv("JWT_ALGORITHM", "HS256"), "typ": "JWT"}
     signing_input = ".".join([_b64_json(header), _b64_json(payload)])
@@ -202,17 +305,29 @@ def decode_access_token(token: str) -> AuthUser | None:
     if payload.get("aud") != os.getenv("JWT_AUDIENCE", "stock-signal-api"):
         return None
     try:
-        if int(payload.get("exp", 0)) < int(datetime.now(timezone.utc).timestamp()):
+        now = int(datetime.now(timezone.utc).timestamp())
+        if int(payload.get("nbf", 0)) > now or int(payload.get("exp", 0)) < now:
             return None
     except (TypeError, ValueError):
         return None
+    role = normalize_role(str(payload.get("role") or "guest"))
+    token_permissions = payload.get("permissions")
+    permissions = token_permissions if isinstance(token_permissions, list) else sorted(permissions_for_role(role))
     return AuthUser(
         id=str(payload.get("sub") or ""),
         email=str(payload.get("email") or ""),
         username=str(payload.get("username") or ""),
         name=str(payload.get("name") or payload.get("username") or ""),
-        role=str(payload.get("role") or "user"),
+        role=role,
+        permissions=tuple(str(item) for item in permissions),
+        is_guest=bool(payload.get("guest") or role == "guest"),
     )
+
+
+def token_minutes(user: AuthUser) -> int:
+    if user.role == "guest":
+        return max(5, int(os.getenv("JWT_GUEST_TOKEN_MINUTES", "120")))
+    return max(5, int(os.getenv("JWT_ACCESS_TOKEN_MINUTES", "60")))
 
 
 def _b64_json(payload: dict[str, object]) -> str:
@@ -232,3 +347,9 @@ def _sign(value: str) -> str:
     secret = os.getenv("JWT_SECRET", "dev-only-change-me").encode("utf-8")
     digest = hmac.new(secret, value.encode("utf-8"), hashlib.sha256).digest()
     return _b64_encode(digest)
+
+
+def _uuid(value: object):
+    import uuid
+
+    return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))

@@ -28,6 +28,8 @@ class AppUser(Base):
 
     instruments: Mapped[list["InstrumentTag"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     alerts: Mapped[list["PriceAlert"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    portfolios: Mapped[list["PortfolioAccount"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    activities: Mapped[list["PortfolioActivity"]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
 
 class InstrumentTag(Base):
@@ -54,6 +56,47 @@ class InstrumentTag(Base):
     )
 
     user: Mapped[AppUser] = relationship(back_populates="instruments")
+
+
+class PortfolioAccount(Base):
+    __tablename__ = "portfolio_accounts"
+    __table_args__ = (UniqueConstraint("user_id", "name", name="portfolio_accounts_user_name_key"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("app_users.id", ondelete="CASCADE"), nullable=False)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    account_type: Mapped[str] = mapped_column(String, nullable=False, default="Trading")
+    currency: Mapped[str] = mapped_column(String, nullable=False, default="CAD")
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    user: Mapped[AppUser] = relationship(back_populates="portfolios")
+    activities: Mapped[list["PortfolioActivity"]] = relationship(back_populates="portfolio", cascade="all, delete-orphan")
+
+
+class PortfolioActivity(Base):
+    __tablename__ = "portfolio_activities"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("app_users.id", ondelete="CASCADE"), nullable=False)
+    portfolio_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("portfolio_accounts.id", ondelete="CASCADE"), nullable=False)
+    symbol: Mapped[str] = mapped_column(String, nullable=False)
+    activity_type: Mapped[str] = mapped_column(String, nullable=False, default="BUY")
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    shares: Mapped[Decimal] = mapped_column(Numeric, nullable=False, default=0)
+    price: Mapped[Decimal] = mapped_column(Numeric, nullable=False, default=0)
+    amount: Mapped[Decimal] = mapped_column(Numeric, nullable=False, default=0)
+    fees: Mapped[Decimal] = mapped_column(Numeric, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="Completed")
+    note: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    realized_pl: Mapped[Decimal] = mapped_column(Numeric, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    user: Mapped[AppUser] = relationship(back_populates="activities")
+    portfolio: Mapped[PortfolioAccount] = relationship(back_populates="activities")
 
 
 class PriceAlert(Base):

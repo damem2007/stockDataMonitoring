@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from backend.app.database import ensure_database
+from backend.app.routes.account import router as account_router
 from backend.app.routes.alerts import router as alerts_router
 from backend.app.routes.analysis import router as analysis_router
 from backend.app.routes.auth import router as auth_router
@@ -21,6 +22,7 @@ from backend.app.routes.health import router as health_router
 from backend.app.routes.markets import router as markets_router
 from backend.app.routes.portfolio import router as portfolio_router
 from backend.app.routes.workspace import router as workspace_router
+from backend.app.services.workspace.refresh_service import start_workspace_refresh_loop, stop_workspace_refresh_loop
 
 
 load_dotenv()
@@ -29,7 +31,11 @@ load_dotenv()
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     ensure_database()
-    yield
+    refresh_task = await start_workspace_refresh_loop()
+    try:
+        yield
+    finally:
+        await stop_workspace_refresh_loop(refresh_task)
 
 
 def get_allowed_origins() -> list[str]:
@@ -63,6 +69,7 @@ app.add_middleware(
 
 app.include_router(health_router)
 app.include_router(auth_router)
+app.include_router(account_router)
 app.include_router(markets_router)
 app.include_router(workspace_router)
 app.include_router(portfolio_router)

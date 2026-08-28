@@ -119,11 +119,29 @@ def walk_forward_validate(
     all_true: list[int] = []
     all_pred: list[int] = []
     all_proba: list[float] = []
-
+#added the code line below to fix the eror 500 for instruments without a llower trends within the analysis time range
     for fold_id, (train_idx, test_idx) in enumerate(splitter.split(X), start=1):
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y[train_idx], y[test_idx]
-
+        if len(np.unique(y_train)) < 2:
+                    # This fold's training window happened to land on a single-direction
+                    # stretch (e.g. a strong one-way trend), so there's no class boundary
+                    # to learn. Skip it rather than crash — later folds with more history
+                    # usually recover class balance.
+                    fold_rows.append(
+                        {
+                            "fold": fold_id,
+                            "train_size": len(train_idx),
+                            "test_size": len(test_idx),
+                            "accuracy": float("nan"),
+                            "auc": float("nan"),
+                            "positive_rate_test": float(y_test.mean()),
+                            "skipped": True,
+                            "skip_reason": "single_class_train",
+                        }
+                    )
+                    continue
+        #end of the fix, to continue down below
         if model == "gradient_boosting":
             estimator = GradientBoostingClassifier(random_state=42, n_estimators=100, max_depth=2)
         else:
@@ -154,6 +172,24 @@ def walk_forward_validate(
         all_proba.extend(proba.tolist())
 
     fold_frame = pd.DataFrame(fold_rows)
+
+    # Add a column for the fold's skipped status
+    if not all_true:
+        return WalkForwardResult(
+            fold_scores=fold_frame,
+            out_of_sample_accuracy=float("nan"),
+            out_of_sample_auc=float("nan"),
+            n_folds=n_splits,
+            n_samples=len(labeled),
+            baseline_accuracy=float("nan"),
+            note=(
+                "Every walk-forward fold's training window contained only one "
+                "class (the stock moved consistently in one direction across "
+                "the fold boundaries). No ML signal could be validated for this "
+                "period — try a longer history window or a different horizon."
+            ),
+        )
+    #end of quick fix
     pooled_accuracy = float(accuracy_score(all_true, all_pred))
     try:
         pooled_auc = float(roc_auc_score(all_true, all_proba))
@@ -212,6 +248,14 @@ def latest_model_signal(
     labeled = labeled.dropna(subset=FEATURE_COLUMNS, how="all")
     X_train = _clean_features(labeled)
     y_train = labeled["Target"].to_numpy()
+    #added the code line below to fix the eror 500 for instruments without a llower trends within the analysis time range
+    #latest_model_signal which trains on all labeled history — that has its own (much smaller) chance of being single-class
+    if len(np.unique(y_train)) < 2:
+        return LiveModelSignal(
+            float("nan"), model, len(labeled), validation.out_of_sample_accuracy,
+            validation.out_of_sample_auc, False,
+            "All available history moved in one direction — no live signal can be fit.",
+        )
 
     full_frame = build_feature_target_frame(frame, horizon_days=horizon_days)
     latest_row = full_frame.iloc[[-1]]

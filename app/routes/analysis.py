@@ -13,7 +13,7 @@ router = APIRouter(prefix="/api", tags=["analysis"])
 @router.get("/instruments/{symbol}/analysis")
 def instrument_analysis(
     symbol: str,
-    period: str = Query("2y", pattern="^(5d|1mo|3mo|6mo|1y|2y|5y|10y)$"),
+    period: str = Query("2y", pattern="^(5d|1mo|3mo|6mo|ytd|1y|2y|5y|10y)$"),
     interval: str = Query("1d", pattern="^(1m|2m|5m|15m|30m|60m|90m|1h|1d|1wk|1mo)$"),
     refresh: bool = False,
     intent: str = "Hold / Watch",

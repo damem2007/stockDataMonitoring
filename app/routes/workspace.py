@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Body, Depends, HTTPException, status
 
 from backend.app.routes.dependencies import optional_user
 from backend.app.schemas.workspace import InstrumentRequest, OnboardingRequest
 from backend.app.services.auth import AuthUser
 from backend.app.services.workspace.application import save_instruments, save_onboarding, workspace_payload
+from backend.app.services.workspace.application import portfolio_payload
+from backend.app.services.workspace.refresh_service import register_guest_symbols
+from backend.app.services.workspace.watchlist_store import active_symbols
 
 
 router = APIRouter(prefix="/api", tags=["workspace"])
@@ -16,6 +19,20 @@ router = APIRouter(prefix="/api", tags=["workspace"])
 @router.get("/workspace")
 def workspace(exchange: Optional[str] = None, user: Optional[AuthUser] = Depends(optional_user)) -> dict[str, Any]:
     return workspace_payload(user_id=user.id if user else None, exchange=exchange)
+
+
+@router.post("/workspace/sync")
+def sync_workspace(
+    payload: Optional[InstrumentRequest] = Body(default=None),
+    user: Optional[AuthUser] = Depends(optional_user),
+) -> dict[str, Any]:
+    signed_in_user_id = user.id if user and not user.is_guest else None
+    scoped_instruments = payload.instruments if payload else None
+    if scoped_instruments is not None and signed_in_user_id is None:
+        scoped_instruments = [{**row, "role": "Watching"} for row in scoped_instruments]
+        register_guest_symbols(active_symbols(scoped_instruments))
+    data = portfolio_payload(instruments=scoped_instruments, user_id=signed_in_user_id, refresh=False)
+    return {"synced": data}
 
 
 @router.post("/onboarding/watchlist")

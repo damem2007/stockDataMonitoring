@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -9,11 +10,12 @@ from urllib.parse import quote_plus
 import feedparser
 import pandas as pd
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from backend.app.services.market_data.data_sources import DATA_DIR
+from .data_sources import DATA_DIR
 
 #ROOT = Path(__file__).resolve().parents[2]
 NEWS_CACHE_DIR = DATA_DIR / "cache" / "news"
 CACHE_TTL_MINUTES = 15
+NEWS_CACHE_SCHEMA_VERSION = 2
 
 _VADER = SentimentIntensityAnalyzer()
 _FINBERT_PIPELINE = None
@@ -28,17 +30,9 @@ class NewsSource:
 
 
 def news_sources(symbol: str, company_name: str | None = None) -> list[NewsSource]:
-    """RSS sources used for sentiment scanning.
+    """RSS sources used for per-symbol sentiment scanning."""
 
-    Only `symbol_specific=True` sources are used when computing a per-symbol
-    sentiment score. The market-wide feeds (MarketWatch top stories, Reuters
-    business front page) are kept for the News tab's general context, but
-    they are NOT symbol-specific and mixing them into a single stock's
-    sentiment score would silently dilute or contaminate it with unrelated
-    headlines.
-    """
-
-    query = quote_plus(company_name or symbol)
+    search_query = quote_plus(news_search_query(symbol, company_name))
     return [
         NewsSource(
             "Yahoo Finance",
@@ -47,18 +41,8 @@ def news_sources(symbol: str, company_name: str | None = None) -> list[NewsSourc
         ),
         NewsSource(
             "Google News Finance",
-            f"https://news.google.com/rss/search?q={query}%20stock%20finance&hl=en-US&gl=US&ceid=US:en",
+            f"https://news.google.com/rss/search?q={search_query}&hl=en-US&gl=US&ceid=US:en",
             symbol_specific=True,
-        ),
-        NewsSource(
-            "MarketWatch (market-wide)",
-            "https://feeds.content.dowjones.io/public/rss/mw_topstories",
-            symbol_specific=False,
-        ),
-        NewsSource(
-            "Reuters Business (market-wide)",
-            "https://www.reutersagency.com/feed/?best-topics=business-finance&post_type=best",
-            symbol_specific=False,
         ),
     ]
 
@@ -136,6 +120,8 @@ def _read_cache(symbol: str) -> pd.DataFrame | None:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+    if payload.get("schema_version") != NEWS_CACHE_SCHEMA_VERSION:
+        return None
 
     fetched_at = pd.to_datetime(payload.get("fetched_at"))
     if fetched_at is None or pd.isna(fetched_at):
@@ -154,6 +140,7 @@ def _read_cache(symbol: str) -> pd.DataFrame | None:
 def _write_cache(symbol: str, frame: pd.DataFrame) -> None:
     NEWS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
+        "schema_version": NEWS_CACHE_SCHEMA_VERSION,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "rows": json.loads(frame.to_json(orient="records", date_format="iso")),
     }
@@ -173,6 +160,7 @@ def fetch_news(symbol: str, company_name: str | None = None, max_items: int = 25
         if cached is not None:
             return cached
 
+    aliases = relevance_aliases(symbol, company_name)
     rows: list[dict[str, object]] = []
     for source in news_sources(symbol, company_name):
         try:
@@ -185,6 +173,8 @@ def fetch_news(symbol: str, company_name: str | None = None, max_items: int = 25
             published = getattr(entry, "published", None)
             link = getattr(entry, "link", "")
             text = f"{title}. {summary}"
+            if not is_symbol_relevant(text, symbol, aliases):
+                continue
             score, engine = analyze_sentiment(text)
             rows.append(
                 {
@@ -196,12 +186,23 @@ def fetch_news(symbol: str, company_name: str | None = None, max_items: int = 25
                     "Sentiment": score,
                     "SentimentEngine": engine,
                     "SymbolSpecific": source.symbol_specific,
+                    "MatchedAliases": ", ".join(matched_aliases(text, aliases)[:4]),
                 }
             )
 
     if not rows:
         empty = pd.DataFrame(
-            columns=["Source", "Published", "Title", "Summary", "Url", "Sentiment", "SentimentEngine", "SymbolSpecific"]
+            columns=[
+                "Source",
+                "Published",
+                "Title",
+                "Summary",
+                "Url",
+                "Sentiment",
+                "SentimentEngine",
+                "SymbolSpecific",
+                "MatchedAliases",
+            ]
         )
         return empty
 
@@ -237,7 +238,7 @@ def news_sentiment_score(news: pd.DataFrame, symbol_specific_only: bool = True) 
     if symbol_specific_only and "SymbolSpecific" in news.columns:
         scoped = news[news["SymbolSpecific"]]
         if scoped.empty:
-            scoped = news  # fall back rather than silently returning 0
+            return 0.0
 
     recent = scoped.sort_values("Published", ascending=False).head(10).reset_index(drop=True)
     if recent.empty:
@@ -246,3 +247,94 @@ def news_sentiment_score(news: pd.DataFrame, symbol_specific_only: bool = True) 
     weights = pd.Series(range(len(recent), 0, -1), dtype=float)  # most recent gets highest weight
     weighted_avg = float((recent["Sentiment"] * weights).sum() / weights.sum())
     return weighted_avg
+
+
+def news_search_query(symbol: str, company_name: str | None = None) -> str:
+    cleaned = symbol.strip().upper()
+    base = cleaned.split(".", 1)[0]
+    terms: list[str] = []
+    if company_name:
+        terms.append(f'"{company_name}"')
+        short_company = company_without_suffix(company_name)
+        if short_company and short_company.lower() != company_name.lower():
+            terms.append(f'"{short_company}"')
+    terms.extend([f'"{cleaned}"', f'"{base}"'])
+    if cleaned.endswith(".TO"):
+        terms.extend([f'"TSX:{base}"', f'"TSE:{base}"'])
+    joined = " OR ".join(dict.fromkeys(terms))
+    return f"({joined}) (stock OR finance OR earnings OR acquisition)"
+
+
+def relevance_aliases(symbol: str, company_name: str | None = None) -> list[str]:
+    cleaned = symbol.strip().upper()
+    base = cleaned.split(".", 1)[0]
+    aliases = [cleaned]
+    if cleaned.endswith(".TO"):
+        aliases.extend([f"TSX:{base}", f"TSE:{base}", f"({base})"])
+    else:
+        aliases.extend([f"NASDAQ:{base}", f"NYSE:{base}", f"({base})"])
+        if len(base) >= 4:
+            aliases.append(base)
+    if company_name:
+        aliases.extend(company_aliases(company_name))
+    return [alias for alias in dict.fromkeys(alias.strip() for alias in aliases) if alias]
+
+
+def company_aliases(company_name: str) -> list[str]:
+    name = re.sub(r"\s+", " ", company_name).strip()
+    if not name:
+        return []
+    aliases = [name]
+    without_suffix = company_without_suffix(name)
+    if without_suffix:
+        aliases.append(without_suffix)
+    hyphen_parts = [
+        part.strip()
+        for part in re.split(r"[-|]", without_suffix or name)
+        if len(part.strip()) >= 6 or " " in part.strip()
+    ]
+    aliases.extend(hyphen_parts)
+    words = [word for word in re.split(r"\W+", without_suffix or name) if len(word) >= 5]
+    if len(words) >= 2:
+        aliases.append(" ".join(words[:2]))
+    return aliases
+
+
+def company_without_suffix(company_name: str) -> str:
+    name = re.sub(r"\s+", " ", company_name).strip()
+    suffix_pattern = r"\b(incorporated|inc|corp|corporation|company|co|ltd|limited|plc|class\s+[a-z])\.?$"
+    previous = ""
+    while name and previous != name:
+        previous = name
+        name = re.sub(suffix_pattern, "", name, flags=re.IGNORECASE).strip(" ,.-")
+    return name
+
+
+def is_symbol_relevant(text: str, symbol: str, aliases: list[str]) -> bool:
+    lowered = (text or "").lower()
+    if not lowered:
+        return False
+    for alias in aliases:
+        if alias_matches(lowered, alias):
+            return True
+    base = symbol.strip().upper().split(".", 1)[0]
+    if len(base) <= 3:
+        return bool(
+            re.search(rf"\b(tsx|tse|nasdaq|nyse)\s*[:\-]\s*{re.escape(base.lower())}\b", lowered)
+            or re.search(rf"\({re.escape(base.lower())}\)", lowered)
+        )
+    return bool(re.search(rf"\b{re.escape(base.lower())}\b", lowered))
+
+
+def matched_aliases(text: str, aliases: list[str]) -> list[str]:
+    lowered = (text or "").lower()
+    return [alias for alias in aliases if alias_matches(lowered, alias)]
+
+
+def alias_matches(lowered_text: str, alias: str) -> bool:
+    lowered_alias = alias.lower()
+    if not lowered_alias:
+        return False
+    if any(separator in lowered_alias for separator in (":", ".", "(", ")", "-", " ")):
+        return lowered_alias in lowered_text
+    return bool(re.search(rf"\b{re.escape(lowered_alias)}\b", lowered_text))

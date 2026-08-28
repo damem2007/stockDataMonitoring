@@ -68,7 +68,7 @@ def ensure_database(strict: bool = False) -> bool:
     if engine is None:
         return False
     try:
-        from backend.app.models.orm import AppUser, InstrumentTag, PriceAlert  # noqa: F401
+        from backend.app.models.orm import AppUser, InstrumentTag, PortfolioAccount, PortfolioActivity, PriceAlert  # noqa: F401
 
         with engine.begin() as conn:
             conn.execute(text("create extension if not exists pgcrypto"))
