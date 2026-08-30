@@ -3,8 +3,16 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from backend.app.routes.dependencies import require_user
-from backend.app.schemas.auth import LoginRequest, RegisterRequest, TokenResponse
-from backend.app.services.auth import AuthUser, authenticate_user, create_access_token, create_guest_user, register_user
+from backend.app.schemas.auth import LoginRequest, RegisterRequest, TokenResponse, VerificationLinkRequest
+from backend.app.services.auth import (
+    AuthUser,
+    authenticate_user,
+    create_access_token,
+    create_guest_user,
+    register_user,
+    request_account_verification_link,
+    verify_account_token,
+)
 
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -30,7 +38,31 @@ def register(payload: RegisterRequest) -> TokenResponse:
         user = register_user(payload.email, payload.username, payload.full_name, payload.password)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
     return TokenResponse(access_token=create_access_token(user), user=user.as_dict())
+
+
+@router.get("/verify-account", response_model=TokenResponse)
+def verify_account(token: str) -> TokenResponse:
+    try:
+        user = verify_account_token(token)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    return TokenResponse(access_token=create_access_token(user), user=user.as_dict())
+
+
+@router.post("/request-verification")
+def request_verification(payload: VerificationLinkRequest) -> dict[str, str]:
+    try:
+        request_account_verification_link(payload.login)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    return {"status": "queued"}
 
 
 @router.get("/me")

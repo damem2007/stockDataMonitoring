@@ -10,12 +10,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from backend.app.services.email_service import send_local_onboarding
 from dotenv import load_dotenv
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from backend.app.database import database_available, ensure_database, session_scope
-from backend.app.models.orm import AppUser
+from backend.app.models.orm import AccountVerificationToken, AppUser
 from backend.app.services.rbac import normalize_role, permissions_for_role
 
 
@@ -32,6 +34,8 @@ class AuthUser:
     name: str
     role: str = "user"
     permissions: tuple[str, ...] = ()
+    onboarding_status: str = "pending"
+    status: str = "active"
     is_guest: bool = False
 
     def as_dict(self) -> dict[str, Any]:
@@ -42,6 +46,8 @@ class AuthUser:
             "name": self.name,
             "role": self.role,
             "permissions": list(self.permissions or sorted(permissions_for_role(self.role))),
+            "onboardingStatus": self.onboarding_status,
+            "status": self.status,
             "isGuest": self.is_guest,
         }
 
@@ -62,11 +68,12 @@ def authenticate_user(login: str, password: str) -> AuthUser | None:
     return authenticate_local_root(login, password)
 
 
-def register_user(email: str, username: str, full_name: str, password: str) -> AuthUser:
+def register_user(email: str, username: str, full_name: str, password: str,  role: str | None = None) -> AuthUser:
     if not database_available() or not ensure_database():
         raise RuntimeError("Database storage is required for account registration.")
     normalized_email = email.strip().lower()
     normalized_username = username.strip().lower()
+    normalized_role = "user" if role is None or role.strip().lower() == "" else role.strip().lower()
     if not normalized_email or "@" not in normalized_email:
         raise ValueError("A valid email is required.")
     if not normalized_username:
@@ -84,14 +91,43 @@ def register_user(email: str, username: str, full_name: str, password: str) -> A
             username=normalized_username,
             full_name=full_name.strip() or normalized_username,
             password_hash=hash_password(password),
-            role="user",
+            role=normalized_role,
+            onboarding_status="pending",
+            status="active",
         )
         session.add(user)
         try:
             session.flush()
+            session.refresh(user)
         except IntegrityError as exc:
             raise ValueError("An account with that email or username already exists.") from exc
+        if normalized_role == "user":
+            verify_account = create_account_verification_token(session, user) #if request.auth_source == "local" else None
+            frontend_url = os.getenv("FRONTEND_URL", "http://localhost:8520")
+            delivered = send_local_onboarding(user.email, user.username, f"{frontend_url}/account-verification?token={verify_account}")
+            user.onboarding_status = "email_sent" if delivered else "email_pending_configuration"
         return auth_user_from_model(user)
+
+
+def request_account_verification_link(login: str) -> bool:
+    if not database_available() or not ensure_database():
+        raise RuntimeError("Database storage is required for account verification.")
+    normalized_login = login.strip().lower()
+    if not normalized_login:
+        raise ValueError("Email or username is required.")
+    with session_scope() as session:
+        user = session.execute(
+            select(AppUser).where(or_(AppUser.email.ilike(normalized_login), AppUser.username.ilike(normalized_login))).limit(1)
+        ).scalar_one_or_none()
+        if not user:
+            return False
+        if str(user.onboarding_status or "").lower() == "verified":
+            return True
+        verify_account = create_account_verification_token(session, user)
+        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:8520")
+        delivered = send_local_onboarding(user.email, user.username, f"{frontend_url}/account-verification?token={verify_account}")
+        user.onboarding_status = "email_sent" if delivered else "email_pending_configuration"
+        return delivered
 
 
 def update_user_profile(user_id: str, email: str | None = None, username: str | None = None, full_name: str | None = None) -> AuthUser:
@@ -190,6 +226,8 @@ def find_user(login: str) -> dict[str, Any] | None:
             "full_name": user.full_name,
             "password_hash": user.password_hash,
             "role": user.role,
+            "onboarding_status": user.onboarding_status,
+            "status": user.status,
         }
 
 
@@ -220,6 +258,8 @@ def auth_user_from_row(row: dict[str, Any]) -> AuthUser:
         name=str(row.get("full_name") or row["username"]),
         role=role,
         permissions=tuple(sorted(permissions_for_role(role))),
+        onboarding_status=str(row.get("onboarding_status") or "pending"),
+        status=str(row.get("status") or "active"),
     )
 
 
@@ -231,12 +271,14 @@ def auth_user_from_model(user: AppUser) -> AuthUser:
             "username": user.username,
             "full_name": user.full_name,
             "role": user.role,
+            "onboarding_status": user.onboarding_status,
+            "status": user.status,
         }
     )
 
 
-def hash_password(password: str) -> str:
-    salt = secrets.token_hex(16)
+def hash_password(password: str, salt: str | None = None) -> str:
+    salt = salt or secrets.token_hex(16)
     digest = hashlib.pbkdf2_hmac(
         "sha256",
         password.encode("utf-8"),
@@ -353,3 +395,53 @@ def _uuid(value: object):
     import uuid
 
     return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+
+def create_account_verification_token(db: Session, user: AppUser, hours: int = 24) -> str:
+    now = datetime.now(timezone.utc)
+    db.query(AccountVerificationToken).filter(
+        AccountVerificationToken.user_id == user.id,
+        AccountVerificationToken.used_at.is_(None),
+    ).update({AccountVerificationToken.used_at: now}, synchronize_session=False)
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    db.add(
+        AccountVerificationToken(
+            user_id=user.id,
+            token_hash=token_hash,
+            expires_at=now + timedelta(hours=hours),
+        )
+    )
+    return raw_token
+
+
+def verify_account_token(raw_token: str) -> AuthUser:
+    if not raw_token.strip():
+        raise ValueError("Verification token is required.")
+    if not database_available() or not ensure_database():
+        raise RuntimeError("Database storage is required for account verification.")
+    token_hash = hashlib.sha256(raw_token.strip().encode()).hexdigest()
+    now = datetime.now(timezone.utc)
+    with session_scope() as session:
+        token = session.execute(
+            select(AccountVerificationToken).where(
+                AccountVerificationToken.token_hash == token_hash,
+                AccountVerificationToken.used_at.is_(None),
+            )
+        ).scalar_one_or_none()
+        if not token:
+            raise ValueError("Verification link is invalid or has already been used.")
+        expires_at = token.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at < now:
+            token.used_at = now
+            raise ValueError("Verification link has expired.")
+        user = session.get(AppUser, token.user_id)
+        if not user:
+            token.used_at = now
+            raise ValueError("Account was not found.")
+        token.used_at = now
+        user.onboarding_status = "verified"
+        user.status = "active"
+        session.flush()
+        return auth_user_from_model(user)

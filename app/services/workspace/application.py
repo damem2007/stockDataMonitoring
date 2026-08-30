@@ -912,6 +912,7 @@ def build_portfolio_table(
 
         pricing_frame = live_frame if not live_frame.empty else frame
         price = latest_close(pricing_frame)
+        price_date = latest_price_date(pricing_frame)
         prev_close = previous_close(frame, 1)
         week_close = previous_close(frame, 5)
         market_value = shares * price
@@ -930,6 +931,7 @@ def build_portfolio_table(
                 "Avg Cost": average_cost,
                 "Book Cost": book_cost,
                 "Current Price": price,
+                "Price Date": price_date,
                 "Market Value": market_value,
                 "Portfolio %": 0.0,
                 "Today $": today_dollars,
@@ -965,6 +967,7 @@ def build_watchlist_table(
         live_frame = (live_histories or {}).get(symbol, pd.DataFrame())
         pricing_frame = live_frame if not live_frame.empty else frame
         current = latest_close(pricing_frame) if not pricing_frame.empty else float("nan")
+        price_date = latest_price_date(pricing_frame)
         prev = previous_close(frame, 1) if not frame.empty else float("nan")
         week = previous_close(frame, 5) if not frame.empty else float("nan")
         output.append(
@@ -975,6 +978,7 @@ def build_watchlist_table(
                 "Intent": str(item.get("intent") or "Hold / Watch"),
                 "Strategy": str(item.get("strategy") or "Buy-dip"),
                 "Current Price": current,
+                "Price Date": price_date,
                 "Today %": current / prev - 1 if current == current and prev == prev and prev > 0 else float("nan"),
                 "Week %": current / week - 1 if current == current and week == week and week > 0 else float("nan"),
                 "Trend": watchlist_trend(pricing_frame),
@@ -1090,6 +1094,18 @@ def latest_close(frame: pd.DataFrame) -> float:
     if series.empty:
         return float("nan")
     return float(series.iloc[-1]["Close"])
+
+
+def latest_price_date(frame: pd.DataFrame) -> str:
+    if frame.empty or "Date" not in frame.columns:
+        return ""
+    series = frame.dropna(subset=["Date", "Close"]).sort_values("Date")
+    if series.empty:
+        return ""
+    value = series.iloc[-1]["Date"]
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
 
 
 def previous_close(frame: pd.DataFrame, periods_back: int) -> float:

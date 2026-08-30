@@ -9,7 +9,10 @@ from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Numeric, String, Tex
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from backend.app.database import Base
+try:
+    from backend.app.database import Base
+except ModuleNotFoundError:
+    from app.database import Base
 
 
 class AppUser(Base):
@@ -22,6 +25,8 @@ class AppUser(Base):
     password_hash: Mapped[str] = mapped_column(Text, nullable=False)
     role: Mapped[str] = mapped_column(String, nullable=False, default="user")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    onboarding_status: Mapped[str] = mapped_column(String, nullable=False, server_default="pending")
+    status: Mapped[str] = mapped_column(String, nullable=False, server_default="active")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
@@ -119,3 +124,13 @@ class PriceAlert(Base):
     last_triggered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     user: Mapped[AppUser] = relationship(back_populates="alerts")
+
+class AccountVerificationToken(Base):
+    __tablename__ = "account_verification_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("app_users.id", ondelete="CASCADE"), nullable=False, index=True)
+    token_hash: Mapped[str] = mapped_column(String, nullable=False, unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

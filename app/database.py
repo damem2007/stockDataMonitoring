@@ -11,7 +11,7 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 
 load_dotenv()
-
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 class Base(DeclarativeBase):
     pass
@@ -68,7 +68,7 @@ def ensure_database(strict: bool = False) -> bool:
     if engine is None:
         return False
     try:
-        from backend.app.models.orm import AppUser, InstrumentTag, PortfolioAccount, PortfolioActivity, PriceAlert  # noqa: F401
+        from backend.app.models.orm import AccountVerificationToken, AppUser, InstrumentTag, PortfolioAccount, PortfolioActivity, PriceAlert  # noqa: F401
 
         with engine.begin() as conn:
             conn.execute(text("create extension if not exists pgcrypto"))

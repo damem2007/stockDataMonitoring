@@ -18,6 +18,10 @@ class RegisterRequest(BaseModel):
     password: str
 
 
+class VerificationLinkRequest(BaseModel):
+    login: str
+
+
 class ProfileUpdateRequest(BaseModel):
     email: Optional[str] = None
     username: Optional[str] = None
