@@ -144,7 +144,7 @@ def fetch_yahoo_history(
     frame = frame.reset_index()
     if "Datetime" in frame.columns:
         frame = frame.rename(columns={"Datetime": "Date"})
-    frame["Date"] = pd.to_datetime(frame["Date"]).dt.tz_localize(None)
+    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce", utc=True)
     if not history_is_plausible(frame, interval):
         if cache_path.exists():
             cached = pd.read_csv(cache_path, parse_dates=["Date"])
@@ -262,7 +262,7 @@ def _prepare_history(frame: pd.DataFrame) -> pd.DataFrame:
         return frame
 
     frame = frame.copy()
-    frame["Date"] = pd.to_datetime(frame["Date"]).dt.tz_localize(None)
+    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce", utc=True)
     numeric_cols = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
     for col in numeric_cols:
         if col in frame.columns:

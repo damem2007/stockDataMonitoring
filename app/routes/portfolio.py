@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from backend.app.routes.dependencies import require_permission
 from backend.app.schemas.roles import InstrumentRole
@@ -31,8 +31,11 @@ def create_portfolio(payload: OnboardingRequest, user: AuthUser = Depends(requir
 
 
 @router.get("/portfolio")
-def portfolio(user: AuthUser = Depends(require_permission("view_portfolio"))) -> dict[str, Any]:
-    return portfolio_payload(user_id=user.id)
+def portfolio(
+    refresh: bool = Query(False),
+    user: AuthUser = Depends(require_permission("view_portfolio")),
+) -> dict[str, Any]:
+    return portfolio_payload(user_id=user.id, refresh=refresh)
 
 
 @router.patch("/portfolio")

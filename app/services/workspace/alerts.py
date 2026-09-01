@@ -77,6 +77,13 @@ def write_alerts(
     user_id: str | None = None,
 ) -> None:
     normalized = [_normalize_alert(alert) for alert in alerts if str(alert.get("symbol", "")).strip()]
+    seen_ids: set[str] = set()
+    for alert in normalized:
+        alert_id = str(alert.get("id") or "")
+        if not alert_id or alert_id in seen_ids:
+            alert["id"] = uuid.uuid4().hex
+            alert_id = str(alert["id"])
+        seen_ids.add(alert_id)
     if user_id and path == ALERTS_PATH and database_available():
         if not ensure_database():
             raise RuntimeError("Database storage is configured but unreachable; alert changes were not saved.")

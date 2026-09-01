@@ -19,7 +19,8 @@ class RegisterRequest(BaseModel):
 
 
 class VerificationLinkRequest(BaseModel):
-    login: str
+    login: Optional[str] = None
+    token: Optional[str] = None
 
 
 class ProfileUpdateRequest(BaseModel):

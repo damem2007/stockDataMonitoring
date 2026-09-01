@@ -57,7 +57,7 @@ def verify_account(token: str) -> TokenResponse:
 @router.post("/request-verification")
 def request_verification(payload: VerificationLinkRequest) -> dict[str, str]:
     try:
-        request_account_verification_link(payload.login)
+        request_account_verification_link(payload.login, payload.token)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
     except RuntimeError as exc:

@@ -31,7 +31,7 @@ def sync_workspace(
     if scoped_instruments is not None and signed_in_user_id is None:
         scoped_instruments = [{**row, "role": "Watching"} for row in scoped_instruments]
         register_guest_symbols(active_symbols(scoped_instruments))
-    data = portfolio_payload(instruments=scoped_instruments, user_id=signed_in_user_id, refresh=False)
+    data = portfolio_payload(instruments=scoped_instruments, user_id=signed_in_user_id, refresh=True)
     return {"synced": data}
 
 

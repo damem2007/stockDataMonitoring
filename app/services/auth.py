@@ -109,16 +109,31 @@ def register_user(email: str, username: str, full_name: str, password: str,  rol
         return auth_user_from_model(user)
 
 
-def request_account_verification_link(login: str) -> bool:
+def request_account_verification_link(login: str | None = None, raw_token: str | None = None) -> bool:
     if not database_available() or not ensure_database():
         raise RuntimeError("Database storage is required for account verification.")
-    normalized_login = login.strip().lower()
-    if not normalized_login:
-        raise ValueError("Email or username is required.")
+    normalized_login = (login or "").strip().lower()
+    normalized_token = (raw_token or "").strip()
+    if not normalized_login and not normalized_token:
+        raise ValueError("Verification token or email/username is required.")
     with session_scope() as session:
-        user = session.execute(
-            select(AppUser).where(or_(AppUser.email.ilike(normalized_login), AppUser.username.ilike(normalized_login))).limit(1)
-        ).scalar_one_or_none()
+        user: AppUser | None = None
+        if normalized_token:
+            token_hash = hashlib.sha256(normalized_token.encode()).hexdigest()
+            token = session.execute(
+                select(AccountVerificationToken).where(AccountVerificationToken.token_hash == token_hash).limit(1)
+            ).scalar_one_or_none()
+            if token:
+                user = session.get(AppUser, token.user_id)
+                if not user:
+                    raise ValueError("This verification link no longer matches an active account.")
+            elif not normalized_login:
+                raise ValueError("Verification link is invalid. Enter your email or username to request a new link.")
+
+        if user is None and normalized_login:
+            user = session.execute(
+                select(AppUser).where(or_(AppUser.email.ilike(normalized_login), AppUser.username.ilike(normalized_login))).limit(1)
+            ).scalar_one_or_none()
         if not user:
             return False
         if str(user.onboarding_status or "").lower() == "verified":
@@ -439,7 +454,7 @@ def verify_account_token(raw_token: str) -> AuthUser:
         user = session.get(AppUser, token.user_id)
         if not user:
             token.used_at = now
-            raise ValueError("Account was not found.")
+            raise ValueError("This verification link no longer matches an active account.")
         token.used_at = now
         user.onboarding_status = "verified"
         user.status = "active"

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import asdict, is_dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any
 
 import pandas as pd
@@ -68,11 +68,125 @@ def load_analysis_frame(
     yahoo, yahoo_status = fetch_yahoo_history(symbol, period=period, interval=interval, refresh=refresh)
     kaggle, kaggle_status = load_kaggle_history(symbol)
     merged = merge_source_preference(yahoo, kaggle)
+    latest_quote = latest_market_record(symbol, refresh=refresh)
+    merged = apply_latest_market_record(merged, latest_quote)
     status = f"{yahoo_status.source}: {yahoo_status.message}"
     if not kaggle.empty:
         status += f" | {kaggle_status.source}: {kaggle_status.message}"
     benchmark = load_benchmark_frame(benchmark_symbol, period, interval, refresh)
     return add_indicators(merged, benchmark=benchmark), status
+
+
+def latest_market_record(symbol: str, refresh: bool = False) -> dict[str, Any]:
+    """Return the freshest point available for current-price display.
+
+    Yahoo's profile snapshot, quote helper, and history endpoint can lag each
+    other. The app uses this normalized record as the single latest-price
+    overlay so summary, chart, portfolio, and alerts do not disagree simply
+    because they read different cache files.
+    """
+
+    history, _history_status = fetch_yahoo_history(symbol, period="5d", interval="5m", refresh=refresh)
+    history_record = latest_history_record(history)
+    quote, quote_status = fetch_yahoo_quote(symbol)
+    quote_price = _finite_float(quote.get("price"))
+    quote_volume = _finite_float(quote.get("volume"))
+    quote_time = parse_market_time(quote.get("market_time")) or datetime.now(timezone.utc)
+
+    if quote_price is not None:
+        quote_record = {
+            "Date": quote_time,
+            "Open": quote_price,
+            "High": quote_price,
+            "Low": quote_price,
+            "Close": quote_price,
+            "Volume": quote_volume if quote_volume is not None else 0.0,
+            "source": quote_status.source,
+            "fetchedAt": quote.get("fetched_at"),
+        }
+        if not history_record:
+            return quote_record
+        history_time = parse_market_time(history_record.get("Date"))
+        if history_time is None or quote_time >= history_time:
+            return quote_record
+    return history_record
+
+
+def latest_history_record(frame: pd.DataFrame) -> dict[str, Any]:
+    if frame.empty or "Date" not in frame.columns or "Close" not in frame.columns:
+        return {}
+    series = frame.dropna(subset=["Date", "Close"]).sort_values("Date")
+    if series.empty:
+        return {}
+    row = series.iloc[-1]
+    return {
+        "Date": row.get("Date"),
+        "Open": _finite_float(row.get("Open")) or _finite_float(row.get("Close")),
+        "High": _finite_float(row.get("High")) or _finite_float(row.get("Close")),
+        "Low": _finite_float(row.get("Low")) or _finite_float(row.get("Close")),
+        "Close": _finite_float(row.get("Close")),
+        "Volume": _finite_float(row.get("Volume")) or 0.0,
+        "source": "Yahoo Finance intraday history",
+    }
+
+
+def apply_latest_market_record(frame: pd.DataFrame, latest: dict[str, Any]) -> pd.DataFrame:
+    latest_close = _finite_float(latest.get("Close"))
+    latest_date = parse_market_time(latest.get("Date"))
+    if latest_close is None or latest_date is None:
+        return frame
+    row = {
+        "Date": latest_date,
+        "Open": _finite_float(latest.get("Open")) or latest_close,
+        "High": _finite_float(latest.get("High")) or latest_close,
+        "Low": _finite_float(latest.get("Low")) or latest_close,
+        "Close": latest_close,
+        "Adj Close": latest_close,
+        "Volume": _finite_float(latest.get("Volume")) or 0.0,
+    }
+    if frame.empty:
+        return pd.DataFrame([row])
+    updated = frame.copy()
+    for column in updated.columns:
+        if column not in row:
+            row[column] = float("nan")
+    updated = pd.concat([updated, pd.DataFrame([row])], ignore_index=True)
+    updated["Date"] = pd.to_datetime(updated["Date"], errors="coerce", utc=True)
+    updated = updated.dropna(subset=["Date", "Close"]).sort_values("Date")
+    return updated.drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
+
+
+def snapshot_with_latest_quote(snapshot: dict[str, object], latest: dict[str, Any]) -> dict[str, object]:
+    latest_close = _finite_float(latest.get("Close"))
+    if latest_close is None:
+        return snapshot
+    enriched = dict(snapshot)
+    enriched["currentPrice"] = latest_close
+    enriched["regularMarketPrice"] = latest_close
+    latest_date = parse_market_time(latest.get("Date"))
+    if latest_date is not None:
+        enriched["regularMarketTime"] = latest_date.astimezone(timezone.utc).isoformat()
+    if latest.get("fetchedAt"):
+        enriched["quoteFetchedAt"] = latest.get("fetchedAt")
+    return enriched
+
+
+def parse_market_time(value: object) -> datetime | None:
+    if value in {None, ""}:
+        return None
+    parsed = pd.to_datetime(value, errors="coerce", utc=True)
+    if parsed is None or pd.isna(parsed):
+        return None
+    value = parsed.to_pydatetime()
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _finite_float(value: object) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed == parsed and parsed not in {float("inf"), float("-inf")} else None
 
 
 def workspace_payload(user_id: str | None = None, exchange: str | None = None) -> dict[str, Any]:
@@ -349,6 +463,8 @@ def focused_analysis_payload(
         return {"symbol": normalized_symbol, "ok": False, "status": source_status, "history": []}
 
     snapshot, snapshot_status = fetch_yahoo_snapshot(normalized_symbol, refresh=refresh)
+    latest_quote = latest_market_record(normalized_symbol, refresh=False)
+    snapshot = snapshot_with_latest_quote(snapshot, latest_quote)
     company_name = str(snapshot.get("longName") or snapshot.get("shortName") or "")
     news = fetch_news(normalized_symbol, company_name=company_name, refresh=refresh)
     sentiment = news_sentiment_score(news)
@@ -387,6 +503,7 @@ def focused_analysis_payload(
         "sourceStatus": source_status,
         "snapshotStatus": f"{snapshot_status.source}: {snapshot_status.message}",
         "earningsStatus": f"{earnings_status.source}: {earnings_status.message}",
+        "latestQuote": json_safe(latest_quote),
         "benchmark": {"symbol": benchmark_symbol, "name": benchmark_name},
         "history": frame_to_records(frame),
         "volumeProfile": frame_to_records(price_volume_profile(frame)),
@@ -435,6 +552,7 @@ def portfolio_payload(
     category = category_exposure_table(portfolio)
     watchlist = build_watchlist_table(rows, histories, live_histories)
     account = portfolio_account_payload(store_user_id)
+    execution_plans = portfolio_execution_plans(trading_instruments(rows), histories)
     return {
         "account": account,
         "portfolio": frame_to_records(portfolio),
@@ -442,8 +560,8 @@ def portfolio_payload(
         "watchlist": frame_to_records(watchlist),
         "activities": list_portfolio_activities(store_user_id),
         "metrics": portfolio_metrics(portfolio),
-        "notes": portfolio_recommendations(portfolio, category),
-        "executionPlans": portfolio_execution_plans(trading_instruments(rows), histories),
+        "notes": portfolio_recommendations(portfolio, category, execution_plans),
+        "executionPlans": execution_plans,
     }
 
 
@@ -688,7 +806,15 @@ def alerts_payload(user_id: str | None = None) -> list[dict[str, Any]]:
 def create_alert_payload(payload: dict[str, Any], user_id: str | None = None) -> dict[str, Any]:
     store_user_id = storage_user_id(user_id)
     alerts = read_alerts(user_id=store_user_id)
-    alert = create_alert(**payload)
+    create_payload = dict(payload)
+    create_payload.pop("id", None)
+    create_payload.pop("created_at", None)
+    create_payload.pop("last_value", None)
+    create_payload.pop("last_triggered_at", None)
+    alert = create_alert(**create_payload)
+    duplicate = next((existing for existing in alerts if alert_signature(existing) == alert_signature(alert)), None)
+    if duplicate:
+        return duplicate
     write_alerts(alerts + [alert], user_id=store_user_id)
     return alert
 
@@ -704,6 +830,21 @@ def delete_alert_payload(alert_id: str, user_id: str | None = None) -> list[dict
     alerts = [alert for alert in read_alerts(user_id=store_user_id) if str(alert.get("id")) != alert_id]
     write_alerts(alerts, user_id=store_user_id)
     return alerts
+
+
+def alert_signature(alert: dict[str, Any]) -> tuple[object, ...]:
+    return (
+        _clean_symbol(alert.get("symbol")),
+        str(alert.get("role") or "Watching"),
+        str(alert.get("metric") or "Price"),
+        str(alert.get("operator") or "Crossing"),
+        round(_safe_nonnegative(alert.get("threshold")), 6),
+        str(alert.get("trigger") or "Once only"),
+        str(alert.get("expiration") or ""),
+        str(alert.get("message") or ""),
+        tuple(str(item) for item in (alert.get("notifications") or ["In-app", "Toast"])),
+        bool(alert.get("enabled", True)),
+    )
 
 
 def evaluate_alerts_payload(user_id: str | None = None) -> dict[str, Any]:
@@ -830,7 +971,10 @@ def frame_to_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
     result = frame.copy()
     for column in result.columns:
         if pd.api.types.is_datetime64_any_dtype(result[column]):
-            result[column] = result[column].dt.strftime("%Y-%m-%dT%H:%M:%S")
+            if isinstance(result[column].dtype, pd.DatetimeTZDtype):
+                result[column] = result[column].dt.tz_convert("UTC").dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            else:
+                result[column] = result[column].dt.strftime("%Y-%m-%dT%H:%M:%S")
     return [json_safe(row) for row in result.to_dict("records")]
 
 
@@ -912,7 +1056,7 @@ def build_portfolio_table(
 
         pricing_frame = live_frame if not live_frame.empty else frame
         price = latest_close(pricing_frame)
-        price_date = latest_price_date(pricing_frame)
+        price_date = latest_price_date(pricing_frame, symbol)
         prev_close = previous_close(frame, 1)
         week_close = previous_close(frame, 5)
         market_value = shares * price
@@ -967,7 +1111,7 @@ def build_watchlist_table(
         live_frame = (live_histories or {}).get(symbol, pd.DataFrame())
         pricing_frame = live_frame if not live_frame.empty else frame
         current = latest_close(pricing_frame) if not pricing_frame.empty else float("nan")
-        price_date = latest_price_date(pricing_frame)
+        price_date = latest_price_date(pricing_frame, symbol)
         prev = previous_close(frame, 1) if not frame.empty else float("nan")
         week = previous_close(frame, 5) if not frame.empty else float("nan")
         output.append(
@@ -1096,7 +1240,7 @@ def latest_close(frame: pd.DataFrame) -> float:
     return float(series.iloc[-1]["Close"])
 
 
-def latest_price_date(frame: pd.DataFrame) -> str:
+def latest_price_date(frame: pd.DataFrame, symbol: str = "") -> str:
     if frame.empty or "Date" not in frame.columns:
         return ""
     series = frame.dropna(subset=["Date", "Close"]).sort_values("Date")
@@ -1104,7 +1248,11 @@ def latest_price_date(frame: pd.DataFrame) -> str:
         return ""
     value = series.iloc[-1]["Date"]
     if hasattr(value, "isoformat"):
-        return value.isoformat()
+        text = value.isoformat()
+        time_part = text[10:]
+        if symbol.upper().endswith("-USD") and "T" in text and not text.endswith("Z") and "+" not in time_part and "-" not in time_part:
+            return f"{text}Z"
+        return text
     return str(value)
 
 
@@ -1112,7 +1260,12 @@ def previous_close(frame: pd.DataFrame, periods_back: int) -> float:
     series = frame.dropna(subset=["Close"]).sort_values("Date")
     if len(series) <= periods_back:
         return float("nan")
-    return float(series.iloc[-1 - periods_back]["Close"])
+    dated = series.copy()
+    dated["_SessionDate"] = pd.to_datetime(dated["Date"], errors="coerce", utc=True).dt.date
+    sessions = dated.dropna(subset=["_SessionDate"]).groupby("_SessionDate", as_index=False).tail(1)
+    if len(sessions) <= periods_back:
+        return float("nan")
+    return float(sessions.iloc[-1 - periods_back]["Close"])
 
 
 def category_exposure_table(portfolio: pd.DataFrame) -> pd.DataFrame:
@@ -1129,7 +1282,11 @@ def category_exposure_table(portfolio: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
-def portfolio_recommendations(portfolio: pd.DataFrame, category: pd.DataFrame) -> list[str]:
+def portfolio_recommendations(
+    portfolio: pd.DataFrame,
+    category: pd.DataFrame,
+    execution_plans: list[dict[str, Any]] | None = None,
+) -> list[str]:
     notes: list[str] = []
     if portfolio.empty:
         return ["No trading holdings were entered yet."]
@@ -1149,6 +1306,22 @@ def portfolio_recommendations(portfolio: pd.DataFrame, category: pd.DataFrame) -
     day_loss = float(portfolio["Today $"].fillna(0).sum())
     if day_loss < 0:
         notes.append(f"Portfolio is down ${abs(day_loss):,.2f} today; check whether the loss is broad-based or concentrated.")
+    elif day_loss > 0:
+        notes.append(f"Portfolio is up ${day_loss:,.2f} today; check whether the gain is broad-based or driven by one position.")
+    high_impact_plans = [
+        plan
+        for plan in (execution_plans or [])
+        if _safe_nonnegative(plan.get("score")) >= 75
+    ]
+    for plan in high_impact_plans[:2]:
+        symbol = str(plan.get("symbol") or "A holding")
+        action = str(plan.get("action") or "MONITOR")
+        setup = str(plan.get("setup") or plan.get("risk") or "latest price, trend, news, and signal context changed.")
+        notes.append(f"{symbol} has a {action} execution read at {_safe_nonnegative(plan.get('score')):.0f} confidence; {setup}")
+    plan_actions = [str(plan.get("action") or "").upper() for plan in (execution_plans or [])]
+    defensive_count = sum(1 for action in plan_actions if any(term in action for term in ("SELL", "TRIM", "REDUCE", "WAIT")))
+    if defensive_count >= max(2, len(plan_actions) // 2) and plan_actions:
+        notes.append("Several holdings are showing defensive execution reads; review portfolio-level exposure before adding new risk.")
     if not notes:
         notes.append("No major concentration or loss warning was triggered by the current holdings data.")
     return notes
