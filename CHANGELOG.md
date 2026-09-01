@@ -7,7 +7,7 @@
 #### Changed
 - Changed portfolio reads to use cached/hydrated data by default and reserve forced refreshes for explicit sync calls, making initial account hydration faster without showing a misleading empty portfolio first.
 - Changed portfolio inference notes to include execution-plan context derived from price, trend, news, and signal analysis so richer portfolio findings appear under the dashboard Inference section.
-- Changed refresh interval configuration to accept both `REFRESH_INTERVAL_SECONDS` and the older `REFRESH_INTERVAL_SECOND` spelling.
+- Changed refresh interval configuration to accept both `REFRESH_INTERVAL_SECONDS` spelling.
 - Changed analysis pricing so Summary, Chart, ML, Backtest, portfolio rows, and alerts share a fresh latest-market overlay instead of mixing stale snapshot prices with period-specific history cache closes.
 - Changed Yahoo history timestamps to preserve UTC during backend serialization, showing exchange/source timestamps with timezone context instead of backdating UTC rows to local dates.
 - Changed manual workspace sync and portfolio loading to force scoped refreshes for active instruments instead of accepting day-old intraday cache data.
