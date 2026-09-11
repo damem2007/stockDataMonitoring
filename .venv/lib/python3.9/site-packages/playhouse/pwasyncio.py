@@ -5,13 +5,13 @@ import itertools
 import json
 import logging
 import re
+import time
 
 from greenlet import greenlet, getcurrent
 from peewee import *
 from peewee import _atomic, _savepoint, _transaction
 from peewee import _callable_context_manager
 from peewee import __exception_wrapper__
-from peewee import logger as peewee_logger
 from peewee import Psycopg3Adapter
 from playhouse.postgres_ext import Json
 
@@ -88,7 +88,8 @@ def await_(awaitable):
 
 
 class _State(object):
-    __slots__ = ('conn', 'closed', 'transactions', 'ctx', '_task_id', '_task')
+    __slots__ = ('conn', 'closed', 'transactions', 'ctx', 'commit_callbacks',
+                 '_task_id', '_task')
 
     def __init__(self):
         self._task_id = None
@@ -100,6 +101,7 @@ class _State(object):
         self.closed = True
         self.transactions = []
         self.ctx = []
+        self.commit_callbacks = []
 
 
 class _ConnectionState(object):
@@ -185,6 +187,10 @@ class _ConnectionState(object):
     def ctx(self):
         return self._current().ctx
 
+    @property
+    def commit_callbacks(self):
+        return self._current().commit_callbacks
+
     def reset(self):
         try:
             state = self._current()
@@ -229,6 +235,14 @@ class AsyncDatabaseMixin(object):
         self._pool_lock = asyncio.Lock()
         self._closing = False  # Guard against use during shutdown.
 
+    def after_commit(self, fn):
+        if asyncio.iscoroutinefunction(fn):
+            raise ValueError('after_commit() takes a plain callable, and a '
+                             'coroutine would never be awaited. Schedule it '
+                             'instead: after_commit(lambda: asyncio.'
+                             'get_running_loop().create_task(coro())).')
+        return super(AsyncDatabaseMixin, self).after_commit(fn)
+
     def execute_sql(self, sql, params=None):
         try:
             return await_(self.aexecute_sql(sql, params or ()))
@@ -237,10 +251,19 @@ class AsyncDatabaseMixin(object):
             raise MissingGreenletBridge(errmsg + _BRIDGE_ERR_HINT) from exc
 
     async def aexecute_sql(self, sql, params=None):
-        peewee_logger.debug((sql, params))
-        conn = await self.aconnect()
-        with __exception_wrapper__:
-            return await conn.execute(sql, params)
+        self._log_query(sql, params)
+        start = time.perf_counter() if self.query_hooks else None
+        try:
+            conn = await self.aconnect()
+            with __exception_wrapper__:
+                result = await conn.execute(sql, params)
+        except Exception as exc:
+            if start is not None:
+                self._notify_hooks(sql, params, start, exc)
+            raise
+        if start is not None:
+            self._notify_hooks(sql, params, start, None)
+        return result
 
     def connect(self):
         return await_(self.aconnect())
@@ -1123,7 +1146,10 @@ class AsyncPgAtomic(_callable_context_manager):
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.db._state.transactions.pop()
+        outermost = not self.db._state.transactions
         if exc_type:
+            if outermost:
+                self.db._clear_commit_callbacks()
             self.rollback(False)
         else:
             try:
@@ -1131,11 +1157,15 @@ class AsyncPgAtomic(_callable_context_manager):
             except Exception:
                 # asyncpg marks the transaction FAILED when commit errors,
                 # making rollback raise too - don't mask the original.
+                if outermost:
+                    self.db._clear_commit_callbacks()
                 try:
                     self.rollback(False)
                 except Exception:
                     pass
                 raise
+            if outermost:
+                self.db._run_commit_callbacks()
 
     def commit(self, begin=True):
         await_(self.acommit(begin))

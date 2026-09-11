@@ -14,11 +14,13 @@ DATA_DIR = ROOT / "data"
 YAHOO_CACHE_DIR = DATA_DIR / "cache" / "yahoo"
 YAHOO_SNAPSHOT_CACHE_DIR = DATA_DIR / "cache" / "yahoo_snapshot"
 EARNINGS_CACHE_DIR = DATA_DIR / "cache" / "earnings"
+FINANCIALS_CACHE_DIR = DATA_DIR / "cache" / "financials"
 YFINANCE_CACHE_DIR = DATA_DIR / "cache" / "yfinance"
 KAGGLE_DIR = DATA_DIR / "kaggle"
 WATCHLIST_DIR = DATA_DIR / "watchlists"
-SNAPSHOT_SCHEMA_VERSION = 3
+SNAPSHOT_SCHEMA_VERSION = 4
 EARNINGS_SCHEMA_VERSION = 2
+FINANCIALS_SCHEMA_VERSION = 1
 
 
 def configure_yfinance_cache() -> None:
@@ -257,6 +259,81 @@ def fetch_yahoo_snapshot(symbol: str, refresh: bool = False) -> tuple[dict[str, 
     return snapshot, SourceStatus("Yahoo Finance snapshot", f"Fetched profile fields for {symbol}")
 
 
+def fetch_yahoo_financial_statements(symbol: str, refresh: bool = False) -> tuple[dict[str, list[dict[str, object]]], SourceStatus]:
+    """Fetch compact annual financial statements from Yahoo Finance.
+
+    Statement schemas vary by issuer and exchange, so the result preserves
+    metric names and reporting periods rather than assuming every company has
+    the same rows. The cache keeps repeated Portfolio/AI reads bounded.
+    """
+
+    FINANCIALS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = _financials_cache_path(symbol)
+    if cache_path.exists() and not refresh:
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            if payload.get("financials_schema_version") == FINANCIALS_SCHEMA_VERSION:
+                return payload.get("statements", {}), SourceStatus("Yahoo Finance financial statements cache", str(cache_path))
+        except Exception:
+            pass
+
+    try:
+        ticker = yf.Ticker(symbol)
+        statements: dict[str, list[dict[str, object]]] = {}
+        for label, attribute in (
+            ("incomeStatement", "financials"),
+            ("balanceSheet", "balance_sheet"),
+            ("cashFlow", "cashflow"),
+        ):
+            frame = getattr(ticker, attribute, pd.DataFrame)
+            frame = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+            statements[label] = _statement_records(frame)
+        payload = {
+            "financials_schema_version": FINANCIALS_SCHEMA_VERSION,
+            "symbol": symbol,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "statements": statements,
+        }
+        cache_path.write_text(json.dumps(payload), encoding="utf-8")
+        return statements, SourceStatus("Yahoo Finance financial statements", f"Fetched statement rows for {symbol}")
+    except Exception as exc:
+        if cache_path.exists():
+            try:
+                payload = json.loads(cache_path.read_text(encoding="utf-8"))
+                return payload.get("statements", {}), SourceStatus(
+                    "Yahoo Finance financial statements cache",
+                    f"Live statement fetch failed ({type(exc).__name__}); using cached file {cache_path}",
+                    ok=False,
+                )
+            except Exception:
+                pass
+        return {}, SourceStatus("Yahoo Finance financial statements", f"Statement fetch failed: {type(exc).__name__}: {exc}", ok=False)
+
+
+def _financials_cache_path(symbol: str) -> Path:
+    safe = symbol.replace("^", "idx_").replace("/", "-")
+    return FINANCIALS_CACHE_DIR / f"{safe}_financials.json"
+
+
+def _statement_records(frame: pd.DataFrame) -> list[dict[str, object]]:
+    if frame.empty:
+        return []
+    rows: list[dict[str, object]] = []
+    for metric, values in frame.head(80).iterrows():
+        row: dict[str, object] = {"metric": str(metric)}
+        for period, value in values.items():
+            if pd.isna(value):
+                continue
+            period_key = pd.Timestamp(period).strftime("%Y-%m-%d") if not isinstance(period, str) else period
+            try:
+                row[period_key] = float(value)
+            except (TypeError, ValueError):
+                row[period_key] = str(value)
+        if len(row) > 1:
+            rows.append(row)
+    return rows
+
+
 def _prepare_history(frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty:
         return frame
@@ -307,6 +384,11 @@ def _clean_snapshot(info: dict[str, object]) -> dict[str, object]:
         "currentPrice",
         "quoteType",
         "exchange",
+        "exchangeName",
+        "fullExchangeName",
+        "exchangeTimezoneName",
+        "exchangeTimezoneShortName",
+        "market",
         "website",
          # Analyst consensus (Yahoo Finance's Analysis tab surfaces these
         # prominently; the dashboard previously had no independent

@@ -1,5 +1,53 @@
 # Changelog
 
+## 2026-09-09
+- Restricted the Advanced Trading indicator endpoint to authenticated users so it remains a Portfolio-only capability.
+- Added an Advanced Trading indicator service that scores BUY/SELL timing candidates from the existing OHLCV indicator engine and lets OpenAI rank only verified historical dates and prices, with deterministic local interpretation as the fallback.
+- Scoped prediction runs to active authenticated portfolio instruments with a lightweight server-side membership check, including direct standalone prediction URLs.
+- Optimized direct portfolio membership verification to a single user/symbol/active SQL existence query, avoiding the general instrument-store load during URL validation.
+- Added session-scoped portfolio instrument membership validation before direct portfolio symbol analysis requests, returning a clear missing-symbol result instead of allowing an endless analysis load.
+- Added a separate authenticated quantitative prediction module at /api/predictions: it consumes the existing instrument analysis as an explicit input and produces independent 1-, 5-, 10-, 20-, and 60-day direction/return forecasts for one portfolio instrument at a time.
+- Added prediction features for multi-year trading-centre/reversion distance, pullback-from-high, range position, volatility, volume z-score, and candle range/body context, with leakage-controlled sequential folds, regime-aware logistic/gradient-boosting weighting, baseline comparisons, precision/recall/F1/MCC/ROC-AUC/Brier/calibration metrics, feature-impact explanations, monitoring drift flags, and a cost-aware walk-forward backtest.
+- Added structured OpenAI prediction interpretation with compact evidence prompts. OpenAI is interpretation-only; local quantitative evidence remains authoritative and deterministic interpretation is the final fallback.
+- Added prediction_provider_diagnostics persistence and a diagnostics endpoint so OpenAI timeouts, HTTP failures, parse failures, and unusable structured responses retain sanitized provider metadata and a bounded response excerpt for assessment.
+- Added authenticated portfolio prediction picker/menu access and a Prediction tab on portfolio instrument pages.
+- Updated the Market Explorer loader to keep the honest five-stage progress contract while rotating the requested final-synthesis sub-stages during long-running stage 5 / 5 work.
+- Restored execution-checklist visibility for provider-proposed symbols, including rows outside the final selected-instrument list; the checklist no longer filters those rows out.
+- Changed each explicit Market Explorer run to refresh Yahoo-backed candidate evidence before ranking, while retaining cached data as the source fallback when a live fetch fails. Identical refreshed evidence can still produce the same deterministic ranking.
+
+### Backend
+
+#### Changed
+- Added a central `app/config.py` settings module for environment-backed AI disclosures, OpenAI endpoint/model/timeouts/token limits, provider notes, and result schema version, with safe non-secret defaults.
+- Clarified that local analysis is the reproducible OHLCV/evidence and validation layer, not the preferred AI analyst; OpenAI remains the interpretation provider and local rules remain the final fallback.
+- Clarified the analysis-provider contract: deterministic local calculations run first as the reproducible Yahoo-backed evidence and validation layer that OpenAI interprets; local rules are only the final fallback when OpenAI cannot return an interpretation.
+- Moved Market Explorer and instrument-tab disclosure, OpenAI endpoint/model, timeout, token, reasoning, future-provider, and result-schema settings behind environment variables with type-safe defaults.
+- Changed Market Explorer budget distribution to enforce the user's selected allocation policy and prevent AI-generated synthetic cash rows from bypassing authoritative amounts and currencies.
+- Changed the Market Explorer OpenAI request to use the dedicated `OPENAI_MARKET_EXPLORER_MODEL` setting, retaining `gpt-5.6-sol` as the quality-focused default rather than switching to the lower-capability BA_Automation model.
+- Changed the request to cap generated output at 3,000 tokens, use low bounded reasoning effort for GPT-5 models, and allow a 90-second read window so a valid deep analysis is not prematurely sent to the local fallback.
+- Changed Market Explorer provider ordering to attempt OpenAI first, reserve Qwen for its future provider slot, and use deterministic rules-based analysis only as the final fallback.
+- Changed Market Explorer budgets to accept one base currency at a time while preserving the separate CAD/USD/Both plan-currency selection; selected markets, not currency, determine the instrument universe.
+
+#### Added
+- Added an instrument AI-enhancement endpoint that receives the local Yahoo-backed analysis and asynchronously returns structured interpretations for Signal, Chart, ML, Backtest, News, and Portfolio Fit without replacing raw local metrics.
+- Added Yahoo Finance financial-statement acquisition and caching for income statement, balance sheet, and cash-flow rows, with conservative local statement-growth evidence added to signal scoring.
+- Added VIX acquisition and macro-context enrichment to local regime scoring, including high-stress confirmation and sizing caution.
+- Added complete instrument provenance payloads covering OHLCV, financial statements, earnings, news, benchmark, VIX, feature engineering, local ML validation, and backtest inputs.
+- Added OpenAI request telemetry for instrument interpretation, including model, request size, status, elapsed time, and sanitized fallback category.
+- Added a per-instrument Market Explorer analysis engine that runs multi-year trading-centre/reversion, pullback-band and entry-zone, earnings/event, rich-news, PESTEL, thesis-classification, and base/worst/best-case scenario modules before recommendation synthesis.
+- Added module-level evidence to the OpenAI candidate prompt so detailed news, earnings metrics, historical range statistics, and user risk/strategy/intent criteria are available for every reviewed instrument.
+- Added local execution-plan synthesis from the same modules so the final fallback still produces instrument-specific entry guidance, scenario checks, thesis conclusions, and monitoring steps.
+- Added five-year daily Market Explorer history requests, with separate recent one-year movement context and multi-year trading-centre/range statistics.
+- Added a Market Explorer budget-use question for full deployment, investment percentage, or fixed cash reserve, with base-currency cash reserve amounts returned explicitly.
+- Added structured OpenAI provider telemetry for endpoint, model, attempt, response status, elapsed time, and sanitized failure category without logging API keys, prompts, or response bodies.
+- Added redacted OpenAI request diagnostics for request size, candidate count, timeout phase, and response timing so provider availability can be distinguished from model-generation latency.
+- Added a safe fallback reason to the result disclosure so users can distinguish missing backend configuration, timeout, HTTP failure, request failure, and unusable OpenAI output.
+- Added Yahoo Finance `USDCAD=X` conversion metadata for mixed CAD/USD allocations, including quote source, UTC quote time, and a confirmation warning because FX rates change.
+- Added a versioned Market Explorer result contract with explicit run, request, summary, evidence, recommendation, allocation, execution, context, and disclosure sections shared by OpenAI and local rules.
+- Changed provider reconciliation to retain reviewed candidates and the local ranking baseline, union provider and local selections, and preserve local market facts when a provider returns partial instrument data.
+- Added explicit excluded-instrument reporting so preferred workspace symbols are shown with a reason when they cannot be ranked or are not selected for the current plan.
+- Added execution-plan reconciliation so an empty or partial AI execution plan is completed from the local evidence plan for every viable selected instrument.
+
 ## 2026-08-30
 
 ### Backend
@@ -15,7 +63,15 @@
 - Changed the refresh loop to evaluate the local workspace plus each persisted user workspace so mixed local, guest-warmed, and authenticated instruments remain covered.
 - Changed account verification resend so an expired but recognizable verification token can issue a fresh verification link without asking for email or username.
 - Changed verification resend responses to keep generic success messaging while returning a clear stale-account error when a token points to an account that no longer exists.
-- Changed portfolio and watchlist price-date payloads so tokenized `-USD` instruments expose intraday quote timestamps as UTC for clearer local/UTC display.
+- Changed portfolio and watchlist price-date payloads so all supported currencies and markets expose normalized intraday quote timestamps with UTC context for clearer local/UTC display.
+- Added the authenticated `/api/ai-market-explorer/flow` and `/api/ai-market-explorer/analyze` process-flow endpoints, with OpenAI as the active provider and a local-rules response plus future Qwen provider boundary as the fail-safe path.
+- Added `Both` to the market-explorer currency question so users can assess CAD and USD opportunities together.
+- Added `Not sure` to the market-explorer intent question; evidence analysis uses a neutral Hold/Watch read while preserving the user's uncertainty in the generated profile.
+- Added `intentOptions` to market-explorer profile payloads so `Not sure` makes Buy/Add, Sell/Trim, and Hold/Watch available for model comparison and strategy alternatives.
+- Added returned ticker currencies to market-explorer allocations and ranked evidence, plus longer-horizon/YTD trend context so peak-only pullbacks are not treated as sufficient growth-entry evidence.
+- Added authenticated persistence for Market Explorer analysis history, including save, list, delete, delete-all, and refresh-from-saved-input endpoints.
+- Changed market-explorer sector matching to support multiple selected sectors while retaining `Infer` as the no-selection fallback.
+- Fixed market-explorer currency normalization so `Both` resolves to the `CAD`/`USD` currency array and never reaches numeric formatting as `BOTH`.
 
 ## 2026-08-29
 

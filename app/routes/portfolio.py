@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from typing import Any, Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 
+from backend.app.database import database_available, session_scope
+from backend.app.models.orm import InstrumentTag
 from backend.app.routes.dependencies import require_permission
 from backend.app.schemas.roles import InstrumentRole
 from backend.app.schemas.workspace import HoldingActivityRequest, HoldingCloseRequest, OnboardingRequest, PortfolioNameRequest
@@ -36,6 +41,30 @@ def portfolio(
     user: AuthUser = Depends(require_permission("view_portfolio")),
 ) -> dict[str, Any]:
     return portfolio_payload(user_id=user.id, refresh=refresh)
+
+
+@router.get("/portfolio/instruments/{symbol}")
+def portfolio_instrument_membership(symbol: str, user: AuthUser = Depends(require_permission("view_portfolio"))) -> dict[str, Any]:
+    normalized = str(symbol or "").strip().upper()
+    if not database_available():
+        return {"symbol": normalized, "inPortfolio": False}
+    try:
+        with session_scope() as session:
+            registered = session.execute(
+                select(InstrumentTag.id)
+                .where(
+                    InstrumentTag.user_id == UUID(str(user.id)),
+                    InstrumentTag.symbol == normalized,
+                    InstrumentTag.role == InstrumentRole.trading.value,
+                    InstrumentTag.active.is_(True),
+                )
+                .limit(1)
+            ).first() is not None
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Portfolio membership could not be verified right now.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Portfolio membership could not be verified right now.") from exc
+    return {"symbol": normalized, "inPortfolio": registered}
 
 
 @router.patch("/portfolio")

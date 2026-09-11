@@ -21,6 +21,7 @@ from backend.app.routes.auth import router as auth_router
 from backend.app.routes.health import router as health_router
 from backend.app.routes.markets import router as markets_router
 from backend.app.routes.portfolio import router as portfolio_router
+from backend.app.routes.predictions import router as predictions_router
 from backend.app.routes.workspace import router as workspace_router
 from backend.app.services.workspace.refresh_service import start_workspace_refresh_loop, stop_workspace_refresh_loop
 
@@ -49,6 +50,7 @@ def get_allowed_origins() -> list[str]:
         for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
         if origin.strip()
     ]
+    print(list(dict.fromkeys([*configured_origins, *local_dev_origins])))
     return list(dict.fromkeys([*configured_origins, *local_dev_origins]))
 
 
@@ -73,6 +75,7 @@ app.include_router(account_router)
 app.include_router(markets_router)
 app.include_router(workspace_router)
 app.include_router(portfolio_router)
+app.include_router(predictions_router)
 app.include_router(analysis_router)
 app.include_router(alerts_router)
 

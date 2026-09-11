@@ -420,6 +420,22 @@ def build_signal(
         score += analyst_score_adjustment
         reasons.append(analyst_note)
 
+    financial_snapshot = analyst_snapshot or {}
+    for field, label, positive_delta, negative_delta in (
+        ("financialRevenueGrowth", "Revenue", 3.0, -4.0),
+        ("financialNetIncomeGrowth", "Net income", 3.0, -4.0),
+        ("financialOperatingCashFlowGrowth", "Operating cash flow", 2.0, -3.0),
+    ):
+        growth = _num(financial_snapshot.get(field))
+        if growth is None:
+            continue
+        if growth > 0.05:
+            score += positive_delta
+            reasons.append(f"{label} grew {growth:+.1%} in the latest comparable Yahoo statement periods.")
+        elif growth < -0.05:
+            score += negative_delta
+            reasons.append(f"{label} declined {growth:+.1%} in the latest comparable Yahoo statement periods.")
+
     earnings_note = build_earnings_note(analyst_snapshot or {}, days_until_earnings)
     days_to_earnings = resolve_days_until_earnings(analyst_snapshot or {}, days_until_earnings)
     if earnings_note:

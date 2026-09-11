@@ -2,8 +2,20 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from backend.app.routes.dependencies import require_user
+from backend.app.services.analysis.market_explorer import (
+    delete_saved_market_explorer_analysis,
+    list_saved_market_explorer_analyses,
+    market_explorer_flow_payload,
+    market_explorer_recommendation_payload,
+    refresh_saved_market_explorer_analysis,
+    save_market_explorer_analysis,
+)
+from backend.app.services.analysis.instrument_ai import enhance_instrument_analysis
+from backend.app.services.analysis.advanced_trading import build_advanced_trading_indicator
+from backend.app.services.auth import AuthUser
 from backend.app.services.workspace.application import correlation_payload, focused_analysis_payload
 
 
@@ -33,7 +45,81 @@ def instrument_analysis(
     )
 
 
+@router.post("/instruments/{symbol}/ai-analysis")
+def instrument_ai_analysis(symbol: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Return non-blocking AI interpretation for an already loaded local analysis."""
+
+    analysis = payload.get("analysis")
+    if not isinstance(analysis, dict):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="A local analysis payload is required.")
+    portfolio_context = payload.get("portfolioContext") if isinstance(payload.get("portfolioContext"), dict) else None
+    portfolio_rows = payload.get("portfolioRows") if isinstance(payload.get("portfolioRows"), list) else []
+    analysis = {**analysis, "symbol": str(analysis.get("symbol") or symbol).upper()}
+    return enhance_instrument_analysis(analysis, portfolio_context, portfolio_rows)
+
+
+@router.post("/instruments/{symbol}/advanced-trading-indicator")
+def advanced_trading_indicator(symbol: str, payload: dict[str, Any], user: AuthUser = Depends(require_user)) -> dict[str, Any]:
+    """Return the independent Advanced Trading chart overlay."""
+
+    analysis = payload.get("analysis")
+    if not isinstance(analysis, dict):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="A local analysis payload is required.")
+    return build_advanced_trading_indicator(symbol, analysis)
+
+
 @router.get("/correlation")
 def correlation(symbols: str, period: str = "2y", interval: str = "1d") -> dict[str, Any]:
     parsed = [item.strip().upper() for item in symbols.replace("\n", ",").split(",") if item.strip()]
     return correlation_payload(parsed, period=period, interval=interval)
+
+
+@router.get("/ai-market-explorer/flow")
+def ai_market_explorer_flow() -> dict[str, Any]:
+    return market_explorer_flow_payload()
+
+
+@router.post("/ai-market-explorer/analyze")
+def ai_market_explorer_analyze(payload: dict[str, Any]) -> dict[str, Any]:
+    return market_explorer_recommendation_payload(payload)
+
+
+@router.get("/ai-market-explorer/saved")
+def saved_market_explorer_analyses(user: AuthUser = Depends(require_user)) -> dict[str, Any]:
+    return {"analyses": list_saved_market_explorer_analyses(user.id)}
+
+
+@router.post("/ai-market-explorer/saved")
+def save_market_explorer(payload: dict[str, Any], user: AuthUser = Depends(require_user)) -> dict[str, Any]:
+    profile = payload.get("profile")
+    result = payload.get("result")
+    if not isinstance(profile, dict) or not isinstance(result, dict):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="A profile and result are required.")
+    return {"analysis": save_market_explorer_analysis(user.id, profile, result, payload.get("title"))}
+
+
+@router.delete("/ai-market-explorer/saved")
+def delete_all_saved_market_explorer(user: AuthUser = Depends(require_user)) -> dict[str, int]:
+    return {"deleted": delete_saved_market_explorer_analysis(user.id)}
+
+
+@router.delete("/ai-market-explorer/saved/{analysis_id}")
+def delete_saved_market_explorer(analysis_id: str, user: AuthUser = Depends(require_user)) -> dict[str, int]:
+    try:
+        deleted = delete_saved_market_explorer_analysis(user.id, analysis_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Saved analysis was not found.") from exc
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Saved analysis was not found.")
+    return {"deleted": deleted}
+
+
+@router.post("/ai-market-explorer/saved/{analysis_id}/refresh")
+def refresh_saved_market_explorer(analysis_id: str, user: AuthUser = Depends(require_user)) -> dict[str, Any]:
+    try:
+        analysis = refresh_saved_market_explorer_analysis(user.id, analysis_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Saved analysis was not found.") from exc
+    if analysis is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Saved analysis was not found.")
+    return {"analysis": analysis}

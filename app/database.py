@@ -68,11 +68,22 @@ def ensure_database(strict: bool = False) -> bool:
     if engine is None:
         return False
     try:
-        from backend.app.models.orm import AccountVerificationToken, AppUser, InstrumentTag, PortfolioAccount, PortfolioActivity, PriceAlert  # noqa: F401
+        from backend.app.models.orm import (  # noqa: F401
+            AccountVerificationToken,
+            AppUser,
+            InstrumentTag,
+            PortfolioAccount,
+            PortfolioActivity,
+            PriceAlert,
+            PublicHoliday,
+            PredictionProviderDiagnostic,
+            SavedMarketExplorerAnalysis,
+        )
 
         with engine.begin() as conn:
             conn.execute(text("create extension if not exists pgcrypto"))
             Base.metadata.create_all(bind=conn)
+            conn.execute(text("alter table if exists app_users add column if not exists phone_number varchar"))
         return True
     except SQLAlchemyError:
         if strict:

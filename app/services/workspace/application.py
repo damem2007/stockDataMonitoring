@@ -22,9 +22,11 @@ from backend.app.services.workspace.alerts import (
     write_alerts,
 )
 from backend.app.services.analysis.backtest import backtest_pullback_strategy, walk_forward_backtest
+from backend.app.services.analysis.advanced_trading import build_local_advanced_trading_indicator
 from backend.app.services.market_data.data_sources import (
     days_until_earnings,
     fetch_earnings_calendar,
+    fetch_yahoo_financial_statements,
     fetch_yahoo_history,
     fetch_yahoo_quote,
     fetch_yahoo_snapshot,
@@ -47,6 +49,7 @@ from backend.app.services.workspace.watchlist_store import (
     trading_instruments,
     write_instrument_tags,
 )
+from backend.app.services.workspace.alert_notifications import dispatch_alert_notifications
 
 
 DEFAULT_PERIOD = "2y"
@@ -419,7 +422,7 @@ def normalize_onboarding_rows(
         if role == "Trading":
             purchase_date = str(row.get("purchase_date") or "")
             if average_cost <= 0:
-                errors.append(f"Row {index}: average purchase price is required.")
+                errors.append(f"Row {index}: average purchase price is required before book cost can be calculated.")
             if shares <= 0:
                 errors.append(f"Row {index}: shares are required.")
             if not purchase_date:
@@ -469,11 +472,24 @@ def focused_analysis_payload(
     news = fetch_news(normalized_symbol, company_name=company_name, refresh=refresh)
     sentiment = news_sentiment_score(news)
     earnings, earnings_status = fetch_earnings_calendar(normalized_symbol, refresh=refresh)
+    financial_statements, financials_status = fetch_yahoo_financial_statements(normalized_symbol, refresh=refresh)
     enriched_snapshot = enrich_snapshot_with_earnings(snapshot, earnings)
+    financial_evidence = summarize_financial_statements(financial_statements)
+    enriched_snapshot.update(financial_evidence)
     risk_profile = get_risk_profile(risk_profile_name)
     benchmark_symbol, benchmark_name = benchmark_for_symbol(normalized_symbol)
     benchmark = load_benchmark_frame(benchmark_symbol, period, interval, refresh)
     regime = market_regime(benchmark, profile=risk_profile)
+    vix_frame, vix_status = fetch_yahoo_history("^VIX", period="1y", interval="1d", refresh=refresh)
+    macro_context = build_macro_context(
+        benchmark_symbol,
+        benchmark_name,
+        benchmark,
+        vix_frame,
+        vix_status,
+        regime,
+    )
+    regime = apply_vix_regime_context(regime, macro_context, risk_profile)
     ml_horizon = strategy_model_horizon_days(strategy)
     ml_signal = latest_model_signal(frame, horizon_days=ml_horizon, n_splits=5, model=ml_model)
     days_to_earnings = days_until_earnings(earnings.get("next_earnings_date"))
@@ -496,6 +512,21 @@ def focused_analysis_payload(
     ml_validation = walk_forward_validate(frame, horizon_days=ml_horizon, n_splits=5, model=ml_model)
     ml_validation_summary = dataclass_to_dict(ml_validation)
     ml_validation_summary.pop("fold_scores", None)
+    feature_engineering = build_feature_engineering_payload(frame)
+    data_sources = build_analysis_data_sources(
+        normalized_symbol,
+        frame,
+        source_status,
+        snapshot_status,
+        earnings_status,
+        financials_status,
+        financial_statements,
+        news,
+        benchmark_symbol,
+        benchmark_name,
+        macro_context,
+        vix_status,
+    )
 
     return {
         "ok": True,
@@ -514,8 +545,13 @@ def focused_analysis_payload(
         "newsSentiment": sentiment,
         "snapshot": json_safe(enriched_snapshot),
         "earnings": json_safe(earnings),
+        "financialStatements": json_safe(financial_statements),
+        "financialEvidence": json_safe(financial_evidence),
         "daysUntilEarnings": days_to_earnings,
         "marketRegime": json_safe(regime),
+        "macroContext": json_safe(macro_context),
+        "featureEngineering": json_safe(feature_engineering),
+        "dataSources": json_safe(data_sources),
         "ml": json_safe(dataclass_to_dict(ml_signal)),
         "mlValidation": {
             **json_safe(ml_validation_summary),
@@ -528,6 +564,229 @@ def focused_analysis_payload(
             "walkForwardSummary": json_safe(wf_summary),
         },
     }
+
+
+def build_macro_context(
+    benchmark_symbol: str,
+    benchmark_name: str,
+    benchmark: pd.DataFrame,
+    vix_frame: pd.DataFrame,
+    vix_status: object,
+    regime: dict[str, object],
+) -> dict[str, object]:
+    vix_latest = vix_frame.iloc[-1] if not vix_frame.empty else None
+    vix_value = _numeric_value(vix_latest.get("Close")) if vix_latest is not None else None
+    vix_as_of = vix_latest.get("Date") if vix_latest is not None else None
+    if vix_value is None:
+        vix_band = "Unavailable"
+        vix_read = "No current VIX observation was available."
+    elif vix_value >= 30:
+        vix_band = "High stress"
+        vix_read = "Elevated implied volatility raises gap, sizing, and confirmation risk."
+    elif vix_value >= 20:
+        vix_band = "Elevated"
+        vix_read = "Market volatility is above a calm baseline; use wider uncertainty ranges."
+    else:
+        vix_band = "Calm to moderate"
+        vix_read = "VIX is not signaling broad stress, but it does not remove instrument-specific risk."
+    benchmark_latest = benchmark.iloc[-1] if not benchmark.empty else None
+    return {
+        "benchmark": {
+            "symbol": benchmark_symbol,
+            "name": benchmark_name,
+            "current": _numeric_value(benchmark_latest.get("Close")) if benchmark_latest is not None else None,
+            "asOf": benchmark_latest.get("Date") if benchmark_latest is not None else None,
+            "regime": regime.get("regime"),
+        },
+        "vix": {
+            "symbol": "^VIX",
+            "current": vix_value,
+            "asOf": vix_as_of,
+            "band": vix_band,
+            "read": vix_read,
+            "source": getattr(vix_status, "source", "Yahoo Finance"),
+            "status": getattr(vix_status, "message", "No VIX status available."),
+        },
+    }
+
+
+def summarize_financial_statements(statements: dict[str, list[dict[str, object]]]) -> dict[str, object]:
+    """Create conservative year-over-year statement signals for local scoring."""
+
+    metric_aliases = {
+        "financialRevenueGrowth": ("incomeStatement", ("total revenue", "operating revenue", "revenue")),
+        "financialNetIncomeGrowth": ("incomeStatement", ("net income", "net income common stockholders", "net income including noncontrolling interests")),
+        "financialOperatingCashFlowGrowth": ("cashFlow", ("operating cash flow", "total cash from operating activities")),
+    }
+    result: dict[str, object] = {}
+    notes: list[str] = []
+    for output_key, (statement_name, aliases) in metric_aliases.items():
+        rows = statements.get(statement_name, [])
+        row = next(
+            (
+                candidate for candidate in rows
+                if any(alias in str(candidate.get("metric") or "").lower() for alias in aliases)
+            ),
+            None,
+        )
+        if not row:
+            continue
+        values = sorted(
+            (
+                (str(period), _numeric_value(value))
+                for period, value in row.items()
+                if period != "metric" and _numeric_value(value) is not None
+            ),
+            key=lambda item: item[0],
+        )
+        if len(values) < 2 or not values[-2][1]:
+            continue
+        growth = values[-1][1] / values[-2][1] - 1
+        result[output_key] = round(growth, 4)
+        notes.append(f"{row.get('metric')} changed {growth:+.1%} from {values[-2][0]} to {values[-1][0]}.")
+    if notes:
+        result["financialEvidenceNote"] = " ".join(notes)
+    return result
+
+
+def apply_vix_regime_context(
+    regime: dict[str, object],
+    macro_context: dict[str, object],
+    profile: object,
+) -> dict[str, object]:
+    """Use VIX as a local risk-context adjustment without replacing benchmark rules."""
+
+    result = dict(regime)
+    vix = macro_context.get("vix") if isinstance(macro_context.get("vix"), dict) else {}
+    current = _numeric_value(vix.get("current")) if isinstance(vix, dict) else None
+    result["vix"] = current
+    result["vix_band"] = vix.get("band") if isinstance(vix, dict) else "Unavailable"
+    if current is not None and current >= 30:
+        dampen_points = float(getattr(profile, "regime_dampen_points", 10.0))
+        result["dampen_buy_confidence"] = True
+        result["dampen_points"] = max(float(result.get("dampen_points") or 0.0), dampen_points * 0.5)
+        prior_note = str(result.get("note") or "")
+        result["note"] = f"{prior_note} VIX {current:.1f} indicates high market stress; require stronger confirmation and smaller sizing.".strip()
+    elif current is not None and current >= 20:
+        prior_note = str(result.get("note") or "")
+        result["note"] = f"{prior_note} VIX {current:.1f} is elevated; widen uncertainty ranges and avoid assuming a clean trend.".strip()
+    return result
+
+
+def build_feature_engineering_payload(frame: pd.DataFrame) -> dict[str, object]:
+    fields = (
+        "Return", "EMA20", "EMA50", "RSI14", "ATR14", "MACD", "MACDSignal", "MACDHist",
+        "BBMid", "BBUpper", "BBLower", "BBBandwidth", "BBPercentB", "ADX14", "PlusDI",
+        "MinusDI", "VolumeRatio", "TrendScore", "TrendRegime", "RelativeStrength", "VWAP20",
+        "DonchianHigh20", "DonchianLow20", "DonchianMid20",
+    )
+    latest = frame.iloc[-1] if not frame.empty else None
+    return {
+        "engine": "StockSignal local indicator engine",
+        "inputs": ["Open", "High", "Low", "Close", "Volume"],
+        "features": list(fields),
+        "latest": {field: latest.get(field) for field in fields if latest is not None and field in latest.index},
+        "rows": len(frame.index),
+        "note": "Features are calculated locally from Yahoo Finance OHLCV and benchmark history before any AI interpretation.",
+    }
+
+
+def build_analysis_data_sources(
+    symbol: str,
+    frame: pd.DataFrame,
+    source_status: str,
+    snapshot_status: object,
+    earnings_status: object,
+    financials_status: object,
+    financial_statements: dict[str, list[dict[str, object]]],
+    news: pd.DataFrame,
+    benchmark_symbol: str,
+    benchmark_name: str,
+    macro_context: dict[str, object],
+    vix_status: object,
+) -> list[dict[str, object]]:
+    return [
+        {
+            "area": "Historical OHLCV",
+            "provider": "Yahoo Finance / local cache",
+            "status": source_status,
+            "fields": ["Open", "High", "Low", "Close", "Volume", "Date"],
+            "records": len(frame.index),
+            "symbol": symbol,
+        },
+        {
+            "area": "Financial profile and statement fields",
+            "provider": getattr(snapshot_status, "source", "Yahoo Finance snapshot"),
+            "status": getattr(snapshot_status, "message", "No snapshot status available."),
+            "fields": ["marketCap", "totalRevenue", "revenueGrowth", "grossMargins", "profitMargins", "netIncomeToCommon", "trailingPE", "forwardPE", "dividendYield", "beta", "targetMeanPrice"],
+            "records": 1,
+        },
+        {
+            "area": "Earnings and event calendar",
+            "provider": getattr(earnings_status, "source", "Yahoo Finance earnings calendar"),
+            "status": getattr(earnings_status, "message", "No earnings status available."),
+            "fields": ["next earnings date", "last earnings date", "days until earnings"],
+            "records": 1,
+        },
+        {
+            "area": "Financial statements",
+            "provider": getattr(financials_status, "source", "Yahoo Finance financial statements"),
+            "status": getattr(financials_status, "message", "No financial statement status available."),
+            "fields": ["income statement", "balance sheet", "cash flow"],
+            "records": sum(len(rows) for rows in financial_statements.values()),
+        },
+        {
+            "area": "Benchmark and macro context",
+            "provider": "Yahoo Finance",
+            "status": f"{benchmark_name} ({benchmark_symbol}) plus VIX (^VIX)",
+            "fields": ["benchmark regime", "benchmark EMA50", "benchmark ADX", "VIX level", "VIX stress band"],
+            "records": 2,
+            "macroContext": macro_context,
+        },
+        {
+            "area": "News and sentiment",
+            "provider": "Yahoo Finance news feed / local sentiment scorer",
+            "status": f"{len(news.index)} symbol-specific items matched",
+            "fields": ["source", "published", "title", "summary", "sentiment", "matched aliases"],
+            "records": len(news.index),
+        },
+        {
+            "area": "Feature engineering",
+            "provider": "StockSignal local indicator engine",
+            "status": "Computed from the OHLCV and benchmark rows above",
+            "fields": ["EMA20", "EMA50", "RSI14", "MACD", "ATR14", "ADX14", "Bollinger", "volume ratio", "relative strength", "VWAP", "Donchian channels"],
+            "records": len(frame.index),
+        },
+        {
+            "area": "Model and validation",
+            "provider": "StockSignal local walk-forward model",
+            "status": "Local model probability and out-of-sample validation are included in the analysis payload",
+            "fields": ["direction probability", "accuracy", "AUC", "baseline accuracy", "fold scores"],
+            "records": 1,
+        },
+        {
+            "area": "Strategy backtest",
+            "provider": "StockSignal local backtest engine",
+            "status": "RSI + EMA20 pullback strategy compared with buy-and-hold",
+            "fields": ["win rate", "profit factor", "Sharpe", "maximum drawdown", "benchmark return", "walk-forward consistency"],
+            "records": 1,
+        },
+        {
+            "area": "VIX source status",
+            "provider": getattr(vix_status, "source", "Yahoo Finance"),
+            "status": getattr(vix_status, "message", "No VIX status available."),
+            "fields": ["^VIX close", "UTC date"],
+            "records": 1,
+        },
+    ]
+
+
+def _numeric_value(value: object) -> float | None:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if number == number else None
 
 
 def portfolio_payload(
@@ -548,6 +807,10 @@ def portfolio_payload(
     for symbol in active_symbols(rows):
         live_frame, _status = fetch_yahoo_history(symbol, period="5d", interval="5m", refresh=refresh)
         live_histories[symbol] = live_frame
+    advanced_trading_indicators = {
+        symbol: build_local_advanced_trading_indicator(symbol, live_histories.get(symbol))
+        for symbol in active_symbols(rows)
+    }
     portfolio = build_portfolio_table(trading_instruments(rows), histories, live_histories)
     category = category_exposure_table(portfolio)
     watchlist = build_watchlist_table(rows, histories, live_histories)
@@ -562,6 +825,7 @@ def portfolio_payload(
         "metrics": portfolio_metrics(portfolio),
         "notes": portfolio_recommendations(portfolio, category, execution_plans),
         "executionPlans": execution_plans,
+        "advancedTradingIndicators": advanced_trading_indicators,
     }
 
 
@@ -864,7 +1128,7 @@ def evaluate_alerts_payload(user_id: str | None = None) -> dict[str, Any]:
     updated, triggered = evaluate_alerts(alerts, latest_by_symbol)
     if updated != alerts:
         write_alerts(updated, user_id=store_user_id)
-    return {"alerts": updated, "triggered": triggered}
+    return {"alerts": updated, "triggered": triggered, "notificationDeliveries": dispatch_alert_notifications(user_id, triggered)}
 
 
 def storage_user_id(user_id: str | None = None) -> str | None:
@@ -1070,12 +1334,15 @@ def build_portfolio_table(
             {
                 "Symbol": symbol,
                 "Category": str(item.get("category") or "Unassigned"),
+                "Market": market_for_symbol(symbol),
+                "Currency": currency_for_symbol(symbol),
                 "Shares": shares,
                 "Purchase Date": str(item.get("purchase_date") or ""),
                 "Avg Cost": average_cost,
                 "Book Cost": book_cost,
                 "Current Price": price,
                 "Price Date": price_date,
+                "Price Timezone": "UTC",
                 "Market Value": market_value,
                 "Portfolio %": 0.0,
                 "Today $": today_dollars,
@@ -1118,11 +1385,14 @@ def build_watchlist_table(
             {
                 "Symbol": symbol,
                 "Category": str(item.get("category") or "Unassigned"),
+                "Market": market_for_symbol(symbol),
+                "Currency": currency_for_symbol(symbol),
                 "Reason": str(item.get("watch_reason") or item.get("notes") or ""),
                 "Intent": str(item.get("intent") or "Hold / Watch"),
                 "Strategy": str(item.get("strategy") or "Buy-dip"),
                 "Current Price": current,
                 "Price Date": price_date,
+                "Price Timezone": "UTC",
                 "Today %": current / prev - 1 if current == current and prev == prev and prev > 0 else float("nan"),
                 "Week %": current / week - 1 if current == current and week == week and week > 0 else float("nan"),
                 "Trend": watchlist_trend(pricing_frame),
@@ -1246,14 +1516,10 @@ def latest_price_date(frame: pd.DataFrame, symbol: str = "") -> str:
     series = frame.dropna(subset=["Date", "Close"]).sort_values("Date")
     if series.empty:
         return ""
-    value = series.iloc[-1]["Date"]
-    if hasattr(value, "isoformat"):
-        text = value.isoformat()
-        time_part = text[10:]
-        if symbol.upper().endswith("-USD") and "T" in text and not text.endswith("Z") and "+" not in time_part and "-" not in time_part:
-            return f"{text}Z"
-        return text
-    return str(value)
+    parsed = parse_market_time(series.iloc[-1]["Date"])
+    if parsed is None:
+        return str(series.iloc[-1]["Date"])
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def previous_close(frame: pd.DataFrame, periods_back: int) -> float:

@@ -45,6 +45,10 @@ class TDecimalField(DecimalField):
     field_type = 'TEXT'
     def get_modifiers(self): pass
 
+    def db_value(self, value):
+        if value is not None:
+            return str(super(TDecimalField, self).db_value(value))
+
 
 class ISODateTimeField(DateTimeField):
     formats = [
@@ -523,7 +527,7 @@ class FTSModel(BaseFTSModel):
     @classmethod
     def search_bm25f(cls, term, weights=None, with_score=False,
                      score_alias='score', explicit_ordering=False):
-        """Full-text search for selected `term` using BM25 algorithm."""
+        """Full-text search for selected `term` using BM25F algorithm."""
         return cls._search(
             term,
             weights,
@@ -535,7 +539,7 @@ class FTSModel(BaseFTSModel):
     @classmethod
     def search_lucene(cls, term, weights=None, with_score=False,
                       score_alias='score', explicit_ordering=False):
-        """Full-text search for selected `term` using BM25 algorithm."""
+        """Full-text search for selected `term` using Lucene algorithm."""
         return cls._search(
             term,
             weights,

@@ -32,6 +32,7 @@ class AuthUser:
     email: str
     username: str
     name: str
+    phone_number: str | None = None
     role: str = "user"
     permissions: tuple[str, ...] = ()
     onboarding_status: str = "pending"
@@ -44,6 +45,7 @@ class AuthUser:
             "email": self.email,
             "username": self.username,
             "name": self.name,
+            "phoneNumber": self.phone_number,
             "role": self.role,
             "permissions": list(self.permissions or sorted(permissions_for_role(self.role))),
             "onboardingStatus": self.onboarding_status,
@@ -145,7 +147,7 @@ def request_account_verification_link(login: str | None = None, raw_token: str |
         return delivered
 
 
-def update_user_profile(user_id: str, email: str | None = None, username: str | None = None, full_name: str | None = None) -> AuthUser:
+def update_user_profile(user_id: str, email: str | None = None, username: str | None = None, full_name: str | None = None, phone_number: str | None = None) -> AuthUser:
     if not database_available() or not ensure_database():
         raise RuntimeError("Database storage is required for account management.")
     with session_scope() as session:
@@ -164,6 +166,8 @@ def update_user_profile(user_id: str, email: str | None = None, username: str | 
             user.username = normalized_username
         if full_name is not None:
             user.full_name = full_name.strip()
+        if phone_number is not None:
+            user.phone_number = phone_number.strip() or None
         try:
             session.flush()
         except IntegrityError as exc:
@@ -239,6 +243,7 @@ def find_user(login: str) -> dict[str, Any] | None:
             "email": user.email,
             "username": user.username,
             "full_name": user.full_name,
+            "phone_number": user.phone_number,
             "password_hash": user.password_hash,
             "role": user.role,
             "onboarding_status": user.onboarding_status,
@@ -275,6 +280,7 @@ def auth_user_from_row(row: dict[str, Any]) -> AuthUser:
         permissions=tuple(sorted(permissions_for_role(role))),
         onboarding_status=str(row.get("onboarding_status") or "pending"),
         status=str(row.get("status") or "active"),
+        phone_number=str(row.get("phone_number")) if row.get("phone_number") else None,
     )
 
 
@@ -285,6 +291,7 @@ def auth_user_from_model(user: AppUser) -> AuthUser:
             "email": user.email,
             "username": user.username,
             "full_name": user.full_name,
+            "phone_number": user.phone_number,
             "role": user.role,
             "onboarding_status": user.onboarding_status,
             "status": user.status,
