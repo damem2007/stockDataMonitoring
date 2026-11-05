@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from backend.app.routes.dependencies import require_user
-from backend.app.schemas.auth import LoginRequest, RegisterRequest, TokenResponse, VerificationLinkRequest
-from backend.app.services.auth import (
+from app.routes.dependencies import require_user
+from app.schemas.auth import LoginRequest, RegisterRequest, TokenResponse, VerificationLinkRequest
+from app.services.auth import (
     AuthUser,
     authenticate_user,
     create_access_token,

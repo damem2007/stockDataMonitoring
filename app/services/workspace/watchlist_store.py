@@ -8,9 +8,9 @@ from pathlib import Path
 
 from sqlalchemy import delete, select
 
-from backend.app.database import database_available, ensure_database, session_scope
-from backend.app.models.orm import InstrumentTag as InstrumentTagModel
-from backend.app.services.market_data.data_sources import WATCHLIST_DIR
+from app.database import database_available, ensure_database, session_scope
+from app.models.orm import InstrumentTag as InstrumentTagModel
+from app.services.market_data.data_sources import WATCHLIST_DIR
 
 
 WATCHLIST_METADATA_PATH = WATCHLIST_DIR / "instruments.json"

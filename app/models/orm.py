@@ -10,7 +10,7 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 try:
-    from backend.app.database import Base
+    from app.database import Base
 except ModuleNotFoundError:
     from app.database import Base
 

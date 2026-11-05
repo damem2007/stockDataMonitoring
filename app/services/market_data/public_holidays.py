@@ -6,9 +6,9 @@ from typing import Any, Iterable
 import requests
 from sqlalchemy import select
 
-from backend.app.config import PUBLIC_HOLIDAY_COUNTRIES, PUBLIC_HOLIDAY_SOURCE_URL, PUBLIC_HOLIDAY_SYNC_YEARS
-from backend.app.database import database_available, ensure_database, session_scope
-from backend.app.models.orm import PublicHoliday
+from app.config import PUBLIC_HOLIDAY_COUNTRIES, PUBLIC_HOLIDAY_SOURCE_URL, PUBLIC_HOLIDAY_SYNC_YEARS
+from app.database import database_available, ensure_database, session_scope
+from app.models.orm import PublicHoliday
 
 
 def sync_public_holidays(countries: Iterable[str] | None = None, years: Iterable[int] | None = None) -> dict[str, Any]:

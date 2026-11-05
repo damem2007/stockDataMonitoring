@@ -3,30 +3,27 @@ from __future__ import annotations
 import json
 import logging
 import math
-import os
-import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
-import requests
-
-from backend.app.config import (
+from app.config import (
     AI_DISCLOSURE,
     FUTURE_PROVIDER_NOTE,
     LOCAL_DISCLOSURE,
     MARKET_EXPLORER_RESULT_SCHEMA_VERSION,
-    OPENAI_CONNECT_TIMEOUT_SECONDS,
     OPENAI_MAX_OUTPUT_TOKENS,
     OPENAI_REASONING_EFFORT,
-    OPENAI_READ_TIMEOUT_SECONDS,
-    OPENAI_RESPONSES_ENDPOINT,
-    RECOMMENDED_OPENAI_MODEL,
 )
-from backend.app.services.market_data.data_sources import fetch_yahoo_history
-from backend.app.services.market_data.markets import DEFAULT_WATCHLISTS, EXCHANGES, normalize_symbol
-from backend.app.services.workspace.application import focused_analysis_payload
+from app.services.ai.models import resolve_model
+from app.services.ai.providers import extract_json_object
+from app.services.ai.registry import ProviderRequest, generate_structured_json
+from app.services.analysis.deep_evidence import build_deep_evidence
+from app.services.analysis.pestel import canonical_sector, profile_pestel, sector_pestel
+from app.services.market_data.data_sources import fetch_yahoo_history
+from app.services.market_data.markets import DEFAULT_WATCHLISTS, EXCHANGES, SECTOR_TILTS, explorer_universe_rows, normalize_symbol
+from app.services.workspace.application import focused_analysis_payload
 
 MARKET_EXPLORER_RESULT_LAYOUT: dict[str, Any] = {
     "version": MARKET_EXPLORER_RESULT_SCHEMA_VERSION,
@@ -194,19 +191,55 @@ def market_explorer_flow_payload() -> dict[str, Any]:
     }
 
 
-def market_explorer_recommendation_payload(payload: dict[str, Any]) -> dict[str, Any]:
+ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def emit_progress(on_progress: ProgressCallback | None, **event: Any) -> None:
+    """Report analysis progress without ever letting the callback break the run."""
+
+    if on_progress is None:
+        return
+    try:
+        on_progress(event)
+    except Exception:  # pragma: no cover - reporting must not affect the analysis
+        logger.debug("market_explorer_progress outcome=callback_error", exc_info=True)
+
+
+def market_explorer_recommendation_payload(payload: dict[str, Any], on_progress: ProgressCallback | None = None) -> dict[str, Any]:
     profile = parse_profile(payload)
-    candidates = analyze_candidates(profile)
+    emit_progress(
+        on_progress,
+        stage="profile",
+        message=(
+            f"Investor profile ready: {profile.risk_appetite} risk, {profile.experience.lower()}, "
+            f"{profile.purpose.lower()} purpose, {profile.strategy}, intent {profile.intent}, "
+            f"budget {profile.budget_currency} {profile.budget:,.0f}."
+        ),
+        profile=profile_to_payload(profile),
+    )
+    candidates = analyze_candidates(profile, on_progress=on_progress)
+    emit_progress(on_progress, stage="prediction", message="Drafting descriptive reads and conditional predictive conclusions from the local evidence...")
     local_plan = build_local_plan(profile, candidates)
-    ai_plan, fallback_reason = maybe_generate_openai_plan(profile, candidates, local_plan)
+    ai_plan, fallback_reason = maybe_generate_openai_plan(profile, candidates, local_plan, on_progress=on_progress)
     plan = ai_plan or build_local_plan(profile, candidates, fallback_reason=fallback_reason)
-    return canonical_market_explorer_result(
+    emit_progress(on_progress, stage="alternatives", message="Comparing secondary intents and strategies across sectors...")
+    emit_progress(on_progress, stage="allocation", message="Distributing the budget across the selected instruments and any cash reserve...")
+    result = canonical_market_explorer_result(
         profile,
         candidates,
         local_plan,
         plan,
         generated_at=datetime.now(timezone.utc).isoformat(),
     )
+    emit_progress(
+        on_progress,
+        stage="monitor",
+        message="Plan ready. Live quotes keep the results page current until you run the analysis again.",
+        provider=result.get("provider"),
+        model=result.get("model"),
+        mode=result.get("mode"),
+    )
+    return result
 
 
 def canonical_market_explorer_result(
@@ -341,8 +374,8 @@ def _saved_analysis_payload(record: Any) -> dict[str, Any]:
 
 
 def list_saved_market_explorer_analyses(user_id: str) -> list[dict[str, Any]]:
-    from backend.app.database import session_scope
-    from backend.app.models.orm import SavedMarketExplorerAnalysis
+    from app.database import session_scope
+    from app.models.orm import SavedMarketExplorerAnalysis
 
     with session_scope() as session:
         rows = (
@@ -355,8 +388,8 @@ def list_saved_market_explorer_analyses(user_id: str) -> list[dict[str, Any]]:
 
 
 def save_market_explorer_analysis(user_id: str, profile: dict[str, Any], result: dict[str, Any], title: str | None = None) -> dict[str, Any]:
-    from backend.app.database import session_scope
-    from backend.app.models.orm import SavedMarketExplorerAnalysis
+    from app.database import session_scope
+    from app.models.orm import SavedMarketExplorerAnalysis
 
     with session_scope() as session:
         row = SavedMarketExplorerAnalysis(
@@ -371,8 +404,8 @@ def save_market_explorer_analysis(user_id: str, profile: dict[str, Any], result:
 
 
 def delete_saved_market_explorer_analysis(user_id: str, analysis_id: str | None = None) -> int:
-    from backend.app.database import session_scope
-    from backend.app.models.orm import SavedMarketExplorerAnalysis
+    from app.database import session_scope
+    from app.models.orm import SavedMarketExplorerAnalysis
 
     with session_scope() as session:
         query = session.query(SavedMarketExplorerAnalysis).filter(SavedMarketExplorerAnalysis.user_id == uuid.UUID(str(user_id)))
@@ -389,8 +422,8 @@ def delete_saved_market_explorer_analysis(user_id: str, analysis_id: str | None 
 
 
 def refresh_saved_market_explorer_analysis(user_id: str, analysis_id: str) -> dict[str, Any] | None:
-    from backend.app.database import session_scope
-    from backend.app.models.orm import SavedMarketExplorerAnalysis
+    from app.database import session_scope
+    from app.models.orm import SavedMarketExplorerAnalysis
 
     with session_scope() as session:
         row = (
@@ -496,10 +529,45 @@ def normalize_requested_symbols(symbols: list[Any], markets: list[Any]) -> list[
     return cleaned
 
 
-def analyze_candidates(profile: MarketExplorerProfile) -> list[dict[str, Any]]:
-    symbols = list(profile.preferred_instruments) if profile.preferred_instruments else explorer_universe(profile)
+MAX_EXPLORER_CANDIDATES = 10
+
+
+def analyze_candidates(profile: MarketExplorerProfile, on_progress: ProgressCallback | None = None) -> list[dict[str, Any]]:
+    if profile.preferred_instruments:
+        symbols = list(profile.preferred_instruments)[:MAX_EXPLORER_CANDIDATES]
+        emit_progress(
+            on_progress,
+            stage="universe",
+            message=f"Using your {len(symbols)} preferred instrument(s): {', '.join(symbols)}. Market discovery is skipped and deep analysis starts now.",
+            candidates=symbols,
+            route="preferred-instruments",
+        )
+    else:
+        universe = explorer_universe_details(profile)
+        symbols = [row["symbol"] for row in universe][:MAX_EXPLORER_CANDIDATES]
+        sectors = list(dict.fromkeys(row["sector"] for row in universe if row["symbol"] in symbols))
+        emit_progress(
+            on_progress,
+            stage="universe",
+            message=(
+                f"Discovery universe: {len(symbols)} instruments across {', '.join(profile.markets or tuple(EXCHANGES))} "
+                f"covering {', '.join(sectors)}."
+            ),
+            candidates=symbols,
+            route="explorer",
+            universe=universe[:MAX_EXPLORER_CANDIDATES],
+        )
     rows: list[dict[str, Any]] = []
-    for symbol in symbols[:10]:
+    total = len(symbols)
+    for index, symbol in enumerate(symbols):
+        emit_progress(
+            on_progress,
+            stage="evidence",
+            message=f"Analyzing {symbol} ({index + 1}/{total}): 5-year history, trading centre, pullback bands, earnings, news, and PESTEL...",
+            symbol=symbol,
+            index=index,
+            total=total,
+        )
         try:
             analysis = focused_analysis_payload(
                 symbol,
@@ -511,21 +579,102 @@ def analyze_candidates(profile: MarketExplorerProfile) -> list[dict[str, Any]]:
                 risk_profile_name=profile.risk_appetite,
             )
         except Exception as exc:
-            rows.append({"symbol": symbol, "ok": False, "score": 0.0, "error": f"{type(exc).__name__}: {exc}"})
+            row = {"symbol": symbol, "ok": False, "score": 0.0, "error": f"{type(exc).__name__}: {exc}"}
+            rows.append(row)
+            emit_progress(on_progress, stage="evidence", message=f"{symbol}: analysis failed ({type(exc).__name__}).", symbol=symbol, index=index + 1, total=total, candidate=compact_candidate(row))
             continue
         if not analysis.get("ok"):
-            rows.append({"symbol": symbol, "ok": False, "score": 0.0, "error": str(analysis.get("status") or "No analysis available")})
+            row = {"symbol": symbol, "ok": False, "score": 0.0, "error": str(analysis.get("status") or "No analysis available")}
+            rows.append(row)
+            emit_progress(on_progress, stage="evidence", message=f"{symbol}: no market data was returned.", symbol=symbol, index=index + 1, total=total, candidate=compact_candidate(row))
             continue
-        rows.append(candidate_summary(analysis, profile))
+        row = candidate_summary(analysis, profile)
+        rows.append(row)
+        emit_progress(
+            on_progress,
+            stage="evidence",
+            message=f"{symbol}: {row.get('action')} · evidence score {row.get('score')} · {row.get('sector')}",
+            symbol=symbol,
+            index=index + 1,
+            total=total,
+            candidate=compact_candidate(row),
+        )
     return sorted(rows, key=lambda item: float(item.get("score") or 0), reverse=True)
 
 
+def compact_candidate(row: dict[str, Any]) -> dict[str, Any]:
+    keys = ("symbol", "name", "sector", "currency", "market", "currentPrice", "score", "action", "confidence", "ok", "error")
+    return {key: row.get(key) for key in keys if key in row}
+
+
+def desired_sectors(profile: MarketExplorerProfile) -> list[str]:
+    parts = [item.strip() for item in str(profile.desired_sector or "").split(",") if item.strip()]
+    result: list[str] = []
+    for part in parts:
+        if part.lower() in {"infer", "ai infer", "none", "any"}:
+            continue
+        sector = canonical_sector(part)
+        if sector and sector not in result:
+            result.append(sector)
+    return result
+
+
+def sector_tilt(profile: MarketExplorerProfile) -> tuple[str, ...]:
+    if profile.purpose.lower() == "income":
+        return SECTOR_TILTS["Income"]
+    for key in ("Conservative", "Growth"):
+        if profile.risk_appetite.lower().startswith(key.lower()):
+            return SECTOR_TILTS[key]
+    return SECTOR_TILTS["Balanced"]
+
+
+def explorer_universe_details(profile: MarketExplorerProfile, limit: int = MAX_EXPLORER_CANDIDATES) -> list[dict[str, str]]:
+    """Choose a sector-diverse, market-balanced discovery universe.
+
+    Desired sectors are honoured first. Otherwise sectors are ordered by the
+    investor's risk/purpose tilt and instruments are taken round-robin across
+    sectors and markets, so one exchange or one theme cannot dominate the
+    shortlist that goes into deep analysis.
+    """
+
+    markets = tuple(profile.markets) or tuple(EXCHANGES)
+    rows = explorer_universe_rows(markets)
+    if not rows:
+        return [{"symbol": symbol, "sector": "Unassigned", "market": "Mixed"} for symbol in DEFAULT_WATCHLISTS["Mixed"][:limit]]
+    wanted = desired_sectors(profile)
+    ordered_sectors = wanted + [sector for sector in sector_tilt(profile) if sector not in wanted]
+    by_sector: dict[str, dict[str, list[dict[str, str]]]] = {}
+    for row in rows:
+        by_sector.setdefault(row["sector"], {}).setdefault(row["market"], []).append(row)
+    selected: list[dict[str, str]] = []
+
+    def take(sectors: list[str], cap: int) -> None:
+        while len(selected) < cap:
+            progressed = False
+            for sector in sectors:
+                if len(selected) >= cap:
+                    break
+                buckets = by_sector.get(sector) or {}
+                market_order = [market for market in markets if buckets.get(market)]
+                if not market_order:
+                    continue
+                market = market_order[len(selected) % len(market_order)]
+                selected.append(buckets[market].pop(0))
+                progressed = True
+            if not progressed:
+                break
+
+    if wanted:
+        take(wanted, limit)
+        if len(selected) < 3:
+            take([sector for sector in ordered_sectors if sector not in wanted], limit)
+    else:
+        take(ordered_sectors, limit)
+    return selected[:limit]
+
+
 def explorer_universe(profile: MarketExplorerProfile) -> list[str]:
-    markets = profile.markets or tuple(EXCHANGES)
-    symbols: list[str] = []
-    for market in markets:
-        symbols.extend(DEFAULT_WATCHLISTS.get(market, ()))
-    return list(dict.fromkeys(symbols or DEFAULT_WATCHLISTS["Mixed"]))
+    return [row["symbol"] for row in explorer_universe_details(profile)]
 
 
 def candidate_summary(analysis: dict[str, Any], profile: MarketExplorerProfile) -> dict[str, Any]:
@@ -535,8 +684,8 @@ def candidate_summary(analysis: dict[str, Any], profile: MarketExplorerProfile) 
     latest = latest_history_row(analysis.get("history") or [])
     volume_profile = analysis.get("volumeProfile") or []
     sector = str(snapshot.get("sector") or snapshot.get("industry") or "Unassigned")
-    desired_sectors = [item.strip().lower() for item in profile.desired_sector.split(",") if item.strip()]
-    sector_match = not desired_sectors or any(item in {"infer", "ai infer", "none"} or item in sector.lower() for item in desired_sectors)
+    wanted_sectors = desired_sectors(profile)
+    sector_match = not wanted_sectors or canonical_sector(sector) in wanted_sectors
     base_score = _num(signal.get("confidence"), 45.0)
     rsi = _num(latest.get("RSI14"), 50.0)
     trend = _num(latest.get("TrendScore"), 0.0)
@@ -545,10 +694,21 @@ def candidate_summary(analysis: dict[str, Any], profile: MarketExplorerProfile) 
     score = max(1.0, min(99.0, base_score + sector_bonus + trend * 8.0 + sentiment * 5.0))
     historical = historical_trend_context(analysis.get("history") or [])
     modules = build_instrument_analysis_modules(analysis, profile, snapshot, latest, signal, historical)
+    deep_evidence = build_deep_evidence(
+        analysis.get("history") or [],
+        snapshot,
+        analysis.get("financialStatements") if isinstance(analysis.get("financialStatements"), dict) else {},
+        analysis.get("earnings") if isinstance(analysis.get("earnings"), dict) else {},
+        analysis.get("news") if isinstance(analysis.get("news"), list) else [],
+        intent="Hold / Watch" if profile.intent == "Not sure" else profile.intent,
+        strategy=profile.strategy,
+        risk_profile=profile.risk_appetite,
+    )
     return {
         "symbol": symbol,
         "name": str(snapshot.get("longName") or snapshot.get("shortName") or symbol),
         "sector": sector,
+        "sectorGroup": canonical_sector(sector) or "Unassigned",
         "currency": str(snapshot.get("currency") or ""),
         "market": str(snapshot.get("exchange") or ""),
         "currentPrice": _num(snapshot.get("currentPrice") or snapshot.get("regularMarketPrice"), _num(latest.get("Close"), 0.0)),
@@ -569,6 +729,7 @@ def candidate_summary(analysis: dict[str, Any], profile: MarketExplorerProfile) 
         "pestelEvidence": modules["pestel"],
         "thesis": modules["thesis"],
         "scenarioModel": modules["scenarios"],
+        "deepEvidence": deep_evidence,
         "descriptiveRead": descriptive_read(snapshot, latest, signal, historical),
         "predictiveRead": predictive_read(signal, score, historical),
         "drivers": list(signal.get("reasons") or [])[:4],
@@ -613,7 +774,7 @@ def build_local_plan(
     selected = viable[:6]
     fx_quote = build_fx_quote(profile, selected)
     allocation = allocate_budget(profile, selected, fx_quote)
-    alternatives = build_strategy_alternatives(profile, viable[:4])
+    alternatives = build_strategy_alternatives(profile, viable)
     summary = build_executive_summary(profile, selected)
     return {
         "mode": "local",
@@ -643,44 +804,48 @@ def build_local_plan(
             candidates,
             [str(item.get("symbol") or "") for item in selected],
         ),
-        "pestelContext": local_pestel_context(profile),
+        "pestelContext": local_pestel_context(profile, selected),
         "fxQuote": fx_quote,
         "notFinancialAdvice": True,
         "futureProviderNote": FUTURE_PROVIDER_NOTE,
     }
 
 
+MARKET_EXPLORER_PLAN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": True,
+    "properties": {
+        "executiveSummary": {"type": "string"},
+        "selectedInstruments": {"type": "array", "description": "Provider's preferred instruments; the application will union these with the local evidence baseline.", "items": {"type": "object", "additionalProperties": True}},
+        "allocation": {"type": "array", "description": "Allocation rationale only; the application owns authoritative amounts, currencies, and cash reserve rows.", "items": {"type": "object", "additionalProperties": True}},
+        "alternatives": {"type": "array", "description": "Secondary intent and strategy comparisons.", "items": {"type": "object", "additionalProperties": True}},
+        "executionPlan": {"type": "array", "description": "Provider execution notes; the application will fill missing instruments from local evidence.", "items": {"type": "object", "additionalProperties": True}},
+        "excludedInstruments": {"type": "array", "description": "Optional provider explanations; the application recomputes authoritative exclusions from the evidence set.", "items": {"type": "object", "additionalProperties": True}},
+        "pestelContext": {"type": "array", "description": "Political, economic, social, technological, environmental, and legal context.", "items": {"type": "object", "additionalProperties": True}},
+    },
+}
+
+
 def maybe_generate_openai_plan(
     profile: MarketExplorerProfile,
     candidates: list[dict[str, Any]],
     local_plan: dict[str, Any],
+    on_progress: ProgressCallback | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        reason = "OpenAI was not configured on the backend."
-        logger.warning(
-            "market_explorer_provider provider=openai outcome=skipped reason=missing_api_key "
-            "fallback=local-rules model=%s endpoint=%s",
-            market_explorer_model(),
-            OPENAI_RESPONSES_ENDPOINT,
-        )
-        return None, reason
+    """Ask the active AI provider for the synthesized plan.
+
+    The provider chain (OpenAI now, Qwen reserved, local rules last) lives in
+    ``.services.ai``; this function only prepares the evidence
+    prompt and reconciles the reply with the authoritative local plan.
+    """
+
     model = market_explorer_model()
-    started_at = time.monotonic()
-    logger.info(
-        "market_explorer_provider provider=openai outcome=attempt method=POST model=%s "
-        "endpoint=%s connect_timeout_seconds=%s read_timeout_seconds=%s max_output_tokens=%s",
-        model,
-        OPENAI_RESPONSES_ENDPOINT,
-        OPENAI_CONNECT_TIMEOUT_SECONDS,
-        OPENAI_READ_TIMEOUT_SECONDS,
-        OPENAI_MAX_OUTPUT_TOKENS,
-    )
     prompt = {
-        "task": "Create an AI market explorer output for an educational stock research app. Do not provide financial advice.",
+        "task": "Create an AI market explorer output for an educational stock research . Do not provide financial advice.",
         "instruction": "When intent is Not sure, compare every intent in intentOptions before recommending a conditional action. Treat Not sure as uncertainty, not as a trade action.",
         "analysisMethod": "Run every module for every candidate instrument: multi-year trading-centre and range/reversion analysis; risk/strategy/intent-sensitive pullback bands and entry zones; earnings metrics and event catalysts; current and forward PESTEL; rich news evidence; thesis classification; and an adjusted conclusion that reconciles contradictory signals or observations. Then use those modules together to produce the recommended plan and execution checklist.",
         "profileCriteriaInstruction": "Risk appetite, strategy, and intent are decision inputs, not labels. They must change the preferred entry zone, scenario horizon, sizing caution, and execution recommendation for each instrument.",
+        "outputStyle": "Write a descriptive read first (what happened and why), then an affirmative but conditional predictive conclusion with the base, worst, and best case and the evidence that would invalidate it.",
         "requiredSections": [
             "executiveSummary",
             "selectedInstruments",
@@ -699,205 +864,166 @@ def maybe_generate_openai_plan(
         "scenarioInstruction": "For every instrument, explain the base range, worst-case range test, best-case range test, historical containment proxy, and what would invalidate the scenario. State clearly that these are evidence-based heuristics, not guarantees.",
         "preferredInstrumentInstruction": "When preferred instruments come from a workspace, do not silently omit them. Include each in selectedInstruments or explain it under excludedInstruments with a specific reason based on the supplied evidence.",
         "allocationInstruction": "The allocation policy is authoritative. Use exactly its investable amount and cash reserve. Do not create a synthetic cash-reserve row unless cashReserveAmount is greater than zero, and never replace a cash reserve with a tradable instrument.",
+        "alternativesInstruction": "For alternatives, keep the localDraft ranking evidence and explain how each secondary strategy/intent changes the preferred instruments and sector mix so the user can compare across sectors.",
     }
-    request_body = {
-        "model": model,
-        "input": [
-            {"role": "system", "content": AI_DISCLOSURE},
-            {"role": "user", "content": json.dumps(prompt)},
-        ],
-        "max_output_tokens": OPENAI_MAX_OUTPUT_TOKENS,
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "ai_market_explorer_plan",
-                "strict": False,
-                "schema": {
-                    "type": "object",
-                    "additionalProperties": True,
-                    "properties": {
-                        "executiveSummary": {"type": "string"},
-                        "selectedInstruments": {"type": "array", "description": "Provider's preferred instruments; the application will union these with the local evidence baseline.", "items": {"type": "object", "additionalProperties": True}},
-                        "allocation": {"type": "array", "description": "Allocation rationale only; the application owns authoritative amounts, currencies, and cash reserve rows.", "items": {"type": "object", "additionalProperties": True}},
-                        "alternatives": {"type": "array", "description": "Secondary intent and strategy comparisons.", "items": {"type": "object", "additionalProperties": True}},
-                        "executionPlan": {"type": "array", "description": "Provider execution notes; the application will fill missing instruments from local evidence.", "items": {"type": "object", "additionalProperties": True}},
-                        "excludedInstruments": {"type": "array", "description": "Optional provider explanations; the application recomputes authoritative exclusions from the evidence set.", "items": {"type": "object", "additionalProperties": True}},
-                        "pestelContext": {"type": "array", "description": "Political, economic, social, technological, environmental, and legal context.", "items": {"type": "object", "additionalProperties": True}},
-                    },
-                },
-            }
-        },
-    }
-    if model.startswith("gpt-5"):
-        request_body["reasoning"] = {"effort": OPENAI_REASONING_EFFORT}
-    request_bytes = len(json.dumps(request_body, default=str).encode("utf-8"))
+    emit_progress(
+        on_progress,
+        stage="prediction",
+        message=f"Requesting the AI synthesis from {model}: descriptive read, predictive conclusion, allocation rationale, and execution checklist...",
+        provider="openai",
+        model=model,
+        outcome="attempt",
+    )
+    result = generate_structured_json(
+        ProviderRequest(
+            task="market-explorer",
+            prompt=prompt,
+            schema=MARKET_EXPLORER_PLAN_SCHEMA,
+            schema_name="ai_market_explorer_plan",
+            strict=False,
+            max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+            reasoning_effort=OPENAI_REASONING_EFFORT,
+            model=model,
+            log_prefix="market_explorer_provider",
+            logger=logger,
+            context={"candidate_count": len(candidates)},
+        )
+    )
+    if not result.ok:
+        emit_progress(
+            on_progress,
+            stage="prediction",
+            message=f"AI synthesis unavailable: {result.reason} Deterministic local rules will complete the plan.",
+            provider=result.provider,
+            model=result.model,
+            outcome="fallback",
+        )
+        return None, result.reason
     try:
-        logger.info(
-            "market_explorer_provider provider=openai outcome=request method=POST model=%s "
-            "endpoint=%s connect_timeout_seconds=%s read_timeout_seconds=%s max_output_tokens=%s "
-            "request_bytes=%s candidate_count=%s",
-            model,
-            OPENAI_RESPONSES_ENDPOINT,
-            OPENAI_CONNECT_TIMEOUT_SECONDS,
-            OPENAI_READ_TIMEOUT_SECONDS,
-            OPENAI_MAX_OUTPUT_TOKENS,
-            request_bytes,
-            len(candidates),
-        )
-        response = requests.post(
-            OPENAI_RESPONSES_ENDPOINT,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json=request_body,
-            timeout=(OPENAI_CONNECT_TIMEOUT_SECONDS, OPENAI_READ_TIMEOUT_SECONDS),
-        )
-        elapsed_ms = round((time.monotonic() - started_at) * 1000)
-        logger.info(
-            "market_explorer_provider provider=openai outcome=response model=%s status=%s "
-            "elapsed_ms=%s",
-            model,
-            response.status_code,
-            elapsed_ms,
-        )
-        response.raise_for_status()
-        parsed = extract_response_json(response.json())
-        if not isinstance(parsed, dict):
-            reason = "OpenAI returned an unusable analysis response."
-            logger.warning(
-                "market_explorer_provider provider=openai outcome=fallback reason=invalid_response "
-                "fallback=local-rules model=%s status=%s",
-                model,
-                response.status_code,
-            )
-            return None, reason
-        candidate_currency = {
-            str(item.get("symbol") or ""): str(item.get("currency") or inferred_currency(str(item.get("symbol") or "")))
-            for item in candidates
-        }
-        if isinstance(parsed.get("allocation"), list):
-            parsed["allocation"] = [
-                {
-                    **row,
-                    "currency": candidate_currency.get(str(row.get("symbol") or ""), inferred_currency(str(row.get("symbol") or ""))),
-                }
-                for row in parsed["allocation"]
-                if isinstance(row, dict)
-            ]
-            parsed["allocation"] = merge_ai_allocation_with_currency(
-                profile,
-                parsed["allocation"],
-                local_plan.get("allocation") or [],
-            )
-        if isinstance(parsed.get("selectedInstruments"), list):
-            default_intent = "Hold / Watch" if profile.intent == "Not sure" else profile.intent
-            normalized_selected = [
-                {
-                    **row,
-                    "currency": str(row.get("currency") or candidate_currency.get(str(row.get("symbol") or ""), inferred_currency(str(row.get("symbol") or "")))),
-                    "intent": str(row.get("intent")) if str(row.get("intent") or "") in {"Buy / Add", "Sell / Trim", "Hold / Watch"} else default_intent,
-                    "strategy": str(row.get("strategy")) if str(row.get("strategy") or "") in {"Short-term (1-4 weeks)", "Long-term (6-12 months)", "Buy-dip"} else profile.strategy,
-                }
-                for row in parsed["selectedInstruments"]
-                if isinstance(row, dict) and str(row.get("symbol") or "").strip()
-            ]
-            if normalized_selected:
-                parsed["selectedInstruments"] = normalized_selected
-                parsed["aiSelectedInstruments"] = normalized_selected
-            else:
-                parsed.pop("selectedInstruments", None)
-                parsed["aiSelectedInstruments"] = []
-        ai_selected = rows_from_value(parsed.get("aiSelectedInstruments"))
-        local_selected = rows_from_value(local_plan.get("selectedInstruments"))
-        parsed["selectedInstruments"] = merge_selected_instruments(ai_selected, local_selected)
-        selected_symbols = [str(item.get("symbol") or "") for item in parsed["selectedInstruments"]]
-        parsed["executionPlan"] = merge_execution_plans(
-            parsed.get("executionPlan") if isinstance(parsed.get("executionPlan"), list) else [],
-            local_plan.get("executionPlan") if isinstance(local_plan.get("executionPlan"), list) else [],
-        )
-        parsed["excludedInstruments"] = excluded_instrument_rows(profile, candidates, selected_symbols)
-        return {
-            **local_plan,
-            **parsed,
-            "mode": "ai",
-            "provider": "openai",
-            "model": model,
-            "aiDisclosure": {
-                "aiUsed": True,
-                "fallbackUsed": False,
-                "label": f"AI: {model}",
-                "message": AI_DISCLOSURE,
-            },
-            "fxQuote": local_plan.get("fxQuote"),
-            "allocationPolicy": local_plan.get("allocationPolicy"),
-            "notFinancialAdvice": True,
-            "futureProviderNote": FUTURE_PROVIDER_NOTE,
-        }, None
-    except requests.Timeout:
-        reason = f"OpenAI did not respond within {OPENAI_READ_TIMEOUT_SECONDS} seconds."
-        logger.warning(
-            "market_explorer_provider provider=openai outcome=fallback reason=timeout "
-            "fallback=local-rules model=%s endpoint=%s read_timeout_seconds=%s request_bytes=%s "
-            "candidate_count=%s elapsed_ms=%s",
-            model,
-            OPENAI_RESPONSES_ENDPOINT,
-            OPENAI_READ_TIMEOUT_SECONDS,
-            request_bytes,
-            len(candidates),
-            round((time.monotonic() - started_at) * 1000),
-        )
-        return None, reason
-    except requests.HTTPError as error:
-        status = error.response.status_code if error.response is not None else "unknown"
-        reason = f"OpenAI returned HTTP {status}."
-        logger.warning(
-            "market_explorer_provider provider=openai outcome=fallback reason=http_error "
-            "fallback=local-rules model=%s status=%s",
-            model,
-            status,
-        )
-        return None, reason
-    except requests.RequestException as error:
-        reason = "The OpenAI request could not be completed."
-        logger.warning(
-            "market_explorer_provider provider=openai outcome=fallback reason=request_error "
-            "fallback=local-rules model=%s error_type=%s",
-            model,
-            type(error).__name__,
-        )
-        return None, reason
-    except (ValueError, TypeError) as error:
+        parsed = reconcile_provider_plan(profile, candidates, local_plan, dict(result.payload or {}))
+    except (ValueError, TypeError, KeyError, AttributeError) as error:
         reason = "OpenAI returned a response the application could not parse."
         logger.warning(
-            "market_explorer_provider provider=openai outcome=fallback reason=parse_error "
-            "fallback=local-rules model=%s error_type=%s",
-            model,
+            "market_explorer_provider provider=%s outcome=fallback reason=parse_error fallback=local-rules model=%s error_type=%s",
+            result.provider,
+            result.model,
             type(error).__name__,
         )
+        emit_progress(on_progress, stage="prediction", message=f"AI synthesis could not be reconciled ({type(error).__name__}); using deterministic local rules.", provider=result.provider, model=result.model, outcome="fallback")
         return None, reason
-    except Exception as error:
-        reason = "OpenAI failed unexpectedly while generating the analysis."
-        logger.exception(
-            "market_explorer_provider provider=openai outcome=fallback reason=unexpected_error "
-            "fallback=local-rules model=%s error_type=%s",
-            model,
-            type(error).__name__,
+    emit_progress(
+        on_progress,
+        stage="prediction",
+        message=f"AI synthesis received from {result.model} in {(result.elapsed_ms or 0) / 1000:.1f}s; reconciling it with the local evidence baseline.",
+        provider=result.provider,
+        model=result.model,
+        outcome="ready",
+    )
+    return {
+        **local_plan,
+        **parsed,
+        "mode": "ai",
+        "provider": result.provider,
+        "model": result.model,
+        "aiDisclosure": {
+            "aiUsed": True,
+            "fallbackUsed": False,
+            "label": f"AI: {result.model}",
+            "message": AI_DISCLOSURE,
+            "provider": result.provider,
+            "elapsedMs": result.elapsed_ms,
+        },
+        "fxQuote": local_plan.get("fxQuote"),
+        "allocationPolicy": local_plan.get("allocationPolicy"),
+        "notFinancialAdvice": True,
+        "futureProviderNote": FUTURE_PROVIDER_NOTE,
+    }, None
+
+
+def reconcile_provider_plan(
+    profile: MarketExplorerProfile,
+    candidates: list[dict[str, Any]],
+    local_plan: dict[str, Any],
+    parsed: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep provider narrative while local market facts stay authoritative."""
+
+    candidate_currency = {
+        str(item.get("symbol") or ""): str(item.get("currency") or inferred_currency(str(item.get("symbol") or "")))
+        for item in candidates
+    }
+    if isinstance(parsed.get("allocation"), list):
+        parsed["allocation"] = [
+            {
+                **row,
+                "currency": candidate_currency.get(str(row.get("symbol") or ""), inferred_currency(str(row.get("symbol") or ""))),
+            }
+            for row in parsed["allocation"]
+            if isinstance(row, dict)
+        ]
+        parsed["allocation"] = merge_ai_allocation_with_currency(
+            profile,
+            parsed["allocation"],
+            local_plan.get("allocation") or [],
         )
-        return None, reason
+    if isinstance(parsed.get("selectedInstruments"), list):
+        default_intent = "Hold / Watch" if profile.intent == "Not sure" else profile.intent
+        normalized_selected = [
+            {
+                **row,
+                "currency": str(row.get("currency") or candidate_currency.get(str(row.get("symbol") or ""), inferred_currency(str(row.get("symbol") or "")))),
+                "intent": str(row.get("intent")) if str(row.get("intent") or "") in {"Buy / Add", "Sell / Trim", "Hold / Watch"} else default_intent,
+                "strategy": str(row.get("strategy")) if str(row.get("strategy") or "") in {"Short-term (1-4 weeks)", "Long-term (6-12 months)", "Buy-dip"} else profile.strategy,
+            }
+            for row in parsed["selectedInstruments"]
+            if isinstance(row, dict) and str(row.get("symbol") or "").strip()
+        ]
+        if normalized_selected:
+            parsed["selectedInstruments"] = normalized_selected
+            parsed["aiSelectedInstruments"] = normalized_selected
+        else:
+            parsed.pop("selectedInstruments", None)
+            parsed["aiSelectedInstruments"] = []
+    ai_selected = rows_from_value(parsed.get("aiSelectedInstruments"))
+    local_selected = rows_from_value(local_plan.get("selectedInstruments"))
+    parsed["selectedInstruments"] = merge_selected_instruments(ai_selected, local_selected)
+    selected_symbols = [str(item.get("symbol") or "") for item in parsed["selectedInstruments"]]
+    parsed["executionPlan"] = merge_execution_plans(
+        parsed.get("executionPlan") if isinstance(parsed.get("executionPlan"), list) else [],
+        local_plan.get("executionPlan") if isinstance(local_plan.get("executionPlan"), list) else [],
+    )
+    parsed["excludedInstruments"] = excluded_instrument_rows(profile, candidates, selected_symbols)
+    provider_alternatives = rows_from_value(parsed.get("alternatives"))
+    local_alternatives = rows_from_value(local_plan.get("alternatives"))
+    if local_alternatives:
+        parsed["alternatives"] = merge_alternatives(provider_alternatives, local_alternatives)
+    return parsed
+
+
+def merge_alternatives(provider_rows: list[dict[str, Any]], local_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Attach provider commentary to the locally ranked strategy/intent comparisons."""
+
+    provider_by_key = {
+        (str(row.get("strategy") or "").strip(), str(row.get("intent") or "").strip()): row
+        for row in provider_rows
+    }
+    merged: list[dict[str, Any]] = []
+    for row in local_rows:
+        key = (str(row.get("strategy") or "").strip(), str(row.get("intent") or "").strip())
+        provider_row = provider_by_key.get(key)
+        if provider_row:
+            merged.append({**row, "providerNote": str(provider_row.get("note") or provider_row.get("comparison") or provider_row.get("summary") or "").strip() or None})
+        else:
+            merged.append(row)
+    return merged
 
 
 def extract_response_json(payload: dict[str, Any]) -> dict[str, Any] | None:
-    if "output_text" in payload:
-        return _loads_object(payload["output_text"])
-    for output in payload.get("output", []) or []:
-        for content in output.get("content", []) or []:
-            text = content.get("text") or content.get("output_text")
-            parsed = _loads_object(text)
-            if parsed is not None:
-                return parsed
-    return None
+    return extract_json_object(payload)
 
 
 def market_explorer_model() -> str:
-    return os.getenv("OPENAI_MARKET_EXPLORER_MODEL") or os.getenv("OPENAI_MODEL") or RECOMMENDED_OPENAI_MODEL
+    return resolve_model("market-explorer")
 
 
 def inferred_currency(symbol: str) -> str:
@@ -1110,6 +1236,7 @@ def merge_selected_instruments(
         "pestelEvidence",
         "thesis",
         "scenarioModel",
+        "deepEvidence",
         "href",
     }
     merged: list[dict[str, Any]] = []
@@ -1209,19 +1336,220 @@ def excluded_instrument_rows(
     return rows
 
 
+STRATEGY_OPTIONS = ("Short-term (1-4 weeks)", "Long-term (6-12 months)", "Buy-dip")
+INTENT_OPTIONS = ("Buy / Add", "Sell / Trim", "Hold / Watch")
+
+
 def build_strategy_alternatives(profile: MarketExplorerProfile, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    strategies = ["Short-term (1-4 weeks)", "Long-term (6-12 months)", "Buy-dip"]
-    intents = list(profile.intent_options or ("Buy / Add", "Sell / Trim", "Hold / Watch"))
-    return [
-        {
-            "strategy": strategy,
-            "intent": intent,
-            "note": alternative_note(strategy, intent, candidates),
-        }
-        for strategy in strategies
-        for intent in intents
-        if strategy != profile.strategy or intent != profile.intent
-    ][:6]
+    """Re-rank the reviewed instruments under every other strategy/intent pair.
+
+    The comparison reuses the evidence already computed for each candidate
+    (rule action, RSI, trend, pullback bands, thesis, fundamentals, income) so
+    the user can see how the preferred instruments and sector mix shift when
+    the objective changes, instead of receiving one generic sentence.
+    """
+
+    viable = [item for item in candidates if item.get("ok", True) is not False and _num(item.get("currentPrice"), 0) > 0]
+    primary_intent = "Hold / Watch" if profile.intent == "Not sure" else profile.intent
+    intents = list(INTENT_OPTIONS) if profile.intent == "Not sure" else list(dict.fromkeys([primary_intent, *INTENT_OPTIONS]))
+    primary = rank_for_profile(viable, profile.strategy, primary_intent)
+    rows: list[dict[str, Any]] = []
+    for strategy in STRATEGY_OPTIONS:
+        for intent in intents:
+            if strategy == profile.strategy and intent == primary_intent:
+                continue
+            ranked = rank_for_profile(viable, strategy, intent)
+            rows.append(
+                {
+                    "strategy": strategy,
+                    "intent": intent,
+                    "note": alternative_note(strategy, intent, ranked),
+                    "rankedInstruments": ranked[:4],
+                    "sectorMix": sector_mix(ranked[:4]),
+                    "leadSector": ranked[0]["sector"] if ranked else None,
+                    "comparison": comparison_note(primary, ranked, profile.strategy, primary_intent, strategy, intent),
+                }
+            )
+    return rows
+
+
+def rank_for_profile(candidates: list[dict[str, Any]], strategy: str, intent: str) -> list[dict[str, Any]]:
+    ranked: list[dict[str, Any]] = []
+    for item in candidates:
+        score, reasons = alternative_score(item, strategy, intent)
+        ranked.append(
+            {
+                "symbol": item.get("symbol"),
+                "name": item.get("name"),
+                "sector": item.get("sector") or "Unassigned",
+                "currency": item.get("currency") or inferred_currency(str(item.get("symbol") or "")),
+                "market": item.get("market"),
+                "currentPrice": item.get("currentPrice"),
+                "action": item.get("action"),
+                "baseScore": item.get("score"),
+                "score": round(score, 1),
+                "stance": stance_for(intent, score),
+                "reason": "; ".join(reasons) if reasons else "Ranked on the base evidence score only.",
+            }
+        )
+    return sorted(ranked, key=lambda row: float(row.get("score") or 0), reverse=True)
+
+
+def alternative_score(item: dict[str, Any], strategy: str, intent: str) -> tuple[float, list[str]]:
+    base = _num(item.get("score"), 40.0)
+    history = item.get("historicalTrend") if isinstance(item.get("historicalTrend"), dict) else {}
+    modules = item.get("analysisModules") if isinstance(item.get("analysisModules"), dict) else {}
+    pullback = modules.get("pullback") if isinstance(modules.get("pullback"), dict) else {}
+    thesis = modules.get("thesis") if isinstance(modules.get("thesis"), dict) else {}
+    deep = item.get("deepEvidence") if isinstance(item.get("deepEvidence"), dict) else {}
+    fundamentals = deep.get("fundamentals") if isinstance(deep.get("fundamentals"), dict) else {}
+    metrics = fundamentals.get("metrics") if isinstance(fundamentals.get("metrics"), dict) else {}
+    income = deep.get("incomeAndCapitalPreservation") if isinstance(deep.get("incomeAndCapitalPreservation"), dict) else {}
+    rsi = _num(item.get("rsi14"), 50.0)
+    sentiment = _num(item.get("newsSentiment"), 0.0)
+    ytd = _num(history.get("ytdReturnPct"), 0.0)
+    distance = _num(history.get("distanceFromCentrePct"), 0.0)
+    volatility = _num(history.get("recentYearVolatilityPct") or history.get("dailyVolatilityPct"), 0.0)
+    containment = _num(history.get("historicalRangeContainmentPct"), 0.0)
+    pullback_pct = _num(pullback.get("pullbackPct"), 0.0)
+    active_band = any(isinstance(band, dict) and band.get("active") for band in (pullback.get("bands") or []))
+    revenue_growth = _num(metrics.get("revenueGrowth"), float("nan"))
+    yield_pct = _num(income.get("currentYieldPct"), 0.0)
+    classification = str(thesis.get("classification") or "")
+    action = str(item.get("action") or "WAIT").upper()
+    score = base
+    reasons: list[str] = []
+    lowered = strategy.lower()
+    if "short" in lowered:
+        if 45 <= rsi <= 65:
+            score += 6
+            reasons.append(f"RSI {rsi:.0f} leaves room for a short-term move")
+        elif rsi > 70:
+            score -= 6
+            reasons.append(f"RSI {rsi:.0f} is stretched for a new short-term entry")
+        elif rsi < 30:
+            score += 3
+            reasons.append(f"RSI {rsi:.0f} sets up a mean-reversion bounce")
+        score += max(-8.0, min(8.0, sentiment * 10))
+        if abs(sentiment) >= 0.15:
+            reasons.append(f"news sentiment {sentiment:+.2f}")
+        score += min(volatility, 3.0) * 1.5
+        if volatility >= 1.5:
+            reasons.append(f"{volatility:.1f}% daily volatility supports short-horizon trading")
+        if ytd > 0:
+            score += 3
+    elif "long" in lowered:
+        if classification.startswith("Growth"):
+            score += 10
+            reasons.append("growth-supported thesis")
+        elif classification.startswith(("Range-bound", "Steady")):
+            score -= 5
+            reasons.append("range-bound thesis limits long-term upside")
+        score += max(-8.0, min(8.0, ytd / 5))
+        if abs(ytd) >= 5:
+            reasons.append(f"YTD trend {ytd:+.1f}%")
+        if revenue_growth == revenue_growth and revenue_growth >= 0.05:
+            score += 6
+            reasons.append(f"revenue growth {revenue_growth:+.1%}")
+        if volatility and volatility < 1.5:
+            score += 3
+            reasons.append("lower volatility suits a 6-12 month hold")
+        if yield_pct >= 3:
+            score += 3
+            reasons.append(f"{yield_pct:.1f}% yield adds total return")
+    else:
+        if active_band:
+            score += 10
+            reasons.append("price sits inside an active pullback band")
+        if 6 <= pullback_pct <= 15:
+            score += 6
+            reasons.append(f"{pullback_pct:.1f}% below the one-year high")
+        elif pullback_pct > 20:
+            score -= 4
+            reasons.append(f"{pullback_pct:.1f}% drawdown looks like a falling knife")
+        if distance < 0:
+            score += 4
+            reasons.append("trading below its multi-year centre")
+        if containment >= 80:
+            score += 3
+            reasons.append(f"{containment:.0f}% range containment supports reversion")
+    if intent == "Buy / Add":
+        if action.startswith("BUY"):
+            score += 8
+            reasons.append(f"rule action {action}")
+        elif action.startswith("SELL") or "TRIM" in action:
+            score -= 10
+            reasons.append(f"rule action {action} conflicts with buying")
+    elif intent == "Sell / Trim":
+        if rsi > 70:
+            score += 8
+            reasons.append(f"RSI {rsi:.0f} is overbought")
+        if action.startswith("SELL") or "TRIM" in action:
+            score += 10
+            reasons.append(f"rule action {action}")
+        elif action.startswith("BUY"):
+            score -= 8
+            reasons.append(f"rule action {action} argues against trimming")
+        if pullback_pct <= 3:
+            score += 4
+            reasons.append("price is near its one-year high")
+        if sentiment < -0.15:
+            score += 5
+            reasons.append("negative news flow")
+    else:
+        if abs(distance) <= 5:
+            score += 4
+            reasons.append("price is close to its trading centre")
+        if containment >= 80:
+            score += 4
+            reasons.append("stable historical range")
+        if "WAIT" in action or "HOLD" in action:
+            score += 4
+            reasons.append(f"rule action {action}")
+    return max(1.0, min(99.0, score)), reasons[:3]
+
+
+def stance_for(intent: str, score: float) -> str:
+    if intent == "Buy / Add":
+        return "Strong buy candidate" if score >= 70 else "Staged entry candidate" if score >= 55 else "Watch only"
+    if intent == "Sell / Trim":
+        return "Trim candidate" if score >= 70 else "Review for trimming" if score >= 55 else "Hold for now"
+    return "Core hold" if score >= 70 else "Monitor" if score >= 55 else "Reassess"
+
+
+def sector_mix(rows: list[dict[str, Any]]) -> dict[str, int]:
+    mix: dict[str, int] = {}
+    for row in rows:
+        sector = str(row.get("sector") or "Unassigned")
+        mix[sector] = mix.get(sector, 0) + 1
+    return mix
+
+
+def comparison_note(
+    primary: list[dict[str, Any]],
+    ranked: list[dict[str, Any]],
+    primary_strategy: str,
+    primary_intent: str,
+    strategy: str,
+    intent: str,
+) -> str:
+    if not ranked:
+        return "No candidate evidence is available for comparison yet."
+    leader = ranked[0]
+    primary_symbols = [str(row.get("symbol")) for row in primary]
+    position = primary_symbols.index(str(leader.get("symbol"))) + 1 if str(leader.get("symbol")) in primary_symbols else None
+    movement = (
+        f"{leader.get('symbol')} stays the leader"
+        if position == 1
+        else f"{leader.get('symbol')} moves to the top from #{position}"
+        if position
+        else f"{leader.get('symbol')} enters the shortlist"
+    )
+    sectors = ", ".join(f"{sector} x{count}" for sector, count in sector_mix(ranked[:4]).items())
+    return (
+        f"Compared with your primary plan ({primary_strategy} / {primary_intent}), {strategy} / {intent} "
+        f"means {movement} ({leader.get('stance')}, score {leader.get('score')}); the top four lean {sectors}."
+    )
 
 
 def build_execution_plan(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1562,16 +1890,9 @@ def news_evidence(rows: Any, sentiment: Any) -> dict[str, Any]:
 
 
 def instrument_pestel_context(snapshot: dict[str, Any], profile: MarketExplorerProfile, news: dict[str, Any]) -> list[dict[str, str]]:
-    sector = str(snapshot.get("sector") or snapshot.get("industry") or "the selected sector")
-    market = str(snapshot.get("exchangeName") or snapshot.get("exchange") or "the listed market")
-    return [
-        {"factor": "Political", "current": f"Review regulation, tariffs, tax policy, and government exposure affecting {sector} in {market}.", "forwardWatch": "Watch upcoming policy announcements and sector-specific regulatory decisions."},
-        {"factor": "Economic", "current": "Rates, inflation, FX, demand, and valuation multiples influence the current setup.", "forwardWatch": "Stress-test the thesis against rate, currency, and demand changes over the selected horizon."},
-        {"factor": "Social", "current": f"Customer adoption, demographics, and trust shape demand for {sector} companies.", "forwardWatch": "Look for changes in customer behavior, affordability, and brand or service preference."},
-        {"factor": "Technological", "current": "Technology adoption and disruption can change margins, capital needs, and competitive position.", "forwardWatch": "Monitor product launches, platform shifts, automation, and competitor execution."},
-        {"factor": "Environmental", "current": "Physical climate, energy, and transition exposure may affect operating costs and demand.", "forwardWatch": "Watch climate policy, transition costs, and weather-sensitive operating risks."},
-        {"factor": "Legal", "current": "Litigation, competition rules, disclosure requirements, and sector-specific law can invalidate a technical setup.", "forwardWatch": "Recheck material filings, investigations, and legal decisions before execution."},
-    ]
+    sector = snapshot.get("sector") or snapshot.get("industry") or "the selected sector"
+    market = snapshot.get("exchangeName") or snapshot.get("exchange")
+    return sector_pestel(sector, str(market) if market else None)
 
 
 def thesis_classification(
@@ -1605,23 +1926,19 @@ def thesis_classification(
     }
 
 
-def local_pestel_context(profile: MarketExplorerProfile) -> list[dict[str, str]]:
-    sector = profile.desired_sector if profile.desired_sector.lower() not in {"", "infer"} else "selected sectors"
-    return [
-        {"factor": "Political", "note": f"Screen {sector} for tariffs, regulation, tax policy, and government spending exposure."},
-        {"factor": "Economic", "note": "Rate expectations, inflation, FX, and consumer demand can change valuation multiples and dividend appeal."},
-        {"factor": "Social", "note": "Consumer adoption, demographics, and brand trust can shift growth or defensive demand."},
-        {"factor": "Technological", "note": "AI adoption, platform disruption, and capex cycles can widen winners and losers within a sector."},
-        {"factor": "Environmental", "note": "Energy transition, weather events, and carbon policy matter for utilities, pipelines, industrials, and insurers."},
-        {"factor": "Legal", "note": "Antitrust, securities rules, data privacy, and sector-specific rulings can override chart setups."},
-    ]
+def local_pestel_context(profile: MarketExplorerProfile, candidates: list[dict[str, Any]] | None = None) -> list[dict[str, str]]:
+    sectors = desired_sectors(profile) or [str(item.get("sector")) for item in (candidates or []) if item.get("sector")]
+    return profile_pestel(sectors)
 
 
 def alternative_note(strategy: str, intent: str, candidates: list[dict[str, Any]]) -> str:
     if not candidates:
         return "No candidate evidence is available for comparison yet."
     leader = candidates[0]
-    return f"Under {strategy} / {intent}, start by re-checking {leader.get('symbol')} because it currently has the highest evidence score."
+    return (
+        f"Under {strategy} / {intent}, start by re-checking {leader.get('symbol')} because it has the highest "
+        f"evidence score for that combination ({leader.get('stance') or 'ranked first'})."
+    )
 
 
 def latest_history_row(rows: list[dict[str, Any]]) -> dict[str, Any]:

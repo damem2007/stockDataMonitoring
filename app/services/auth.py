@@ -10,15 +10,15 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from backend.app.services.email_service import send_local_onboarding
+from app.services.email_service import send_local_onboarding
 from dotenv import load_dotenv
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from backend.app.database import database_available, ensure_database, session_scope
-from backend.app.models.orm import AccountVerificationToken, AppUser
-from backend.app.services.rbac import normalize_role, permissions_for_role
+from app.database import database_available, ensure_database, session_scope
+from app.models.orm import AccountVerificationToken, AppUser
+from app.services.rbac import normalize_role, permissions_for_role
 
 
 load_dotenv()

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from backend.app.database import database_status, ensure_database
-from backend.app.services.auth import bootstrap_local_root_user
+from .database import database_status, ensure_database
+from .services.auth import bootstrap_local_root_user
 
 
 def main() -> None:

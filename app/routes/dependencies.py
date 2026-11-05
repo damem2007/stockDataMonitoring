@@ -4,8 +4,8 @@ from typing import Optional
 
 from fastapi import Depends, Header, HTTPException, status
 
-from backend.app.services.auth import AuthUser, decode_access_token
-from backend.app.services.rbac import role_has_permission
+from app.services.auth import AuthUser, decode_access_token
+from app.services.rbac import role_has_permission
 
 
 def optional_user(authorization: Optional[str] = Header(default=None)) -> Optional[AuthUser]:

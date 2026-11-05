@@ -9,9 +9,9 @@ from typing import Any
 
 from sqlalchemy import delete, select
 
-from backend.app.database import database_available, ensure_database, session_scope
-from backend.app.models.orm import PriceAlert as PriceAlertModel
-from backend.app.services.market_data.data_sources import DATA_DIR
+from app.database import database_available, ensure_database, session_scope
+from app.models.orm import PriceAlert as PriceAlertModel
+from app.services.market_data.data_sources import DATA_DIR
 
 
 ALERTS_PATH = DATA_DIR / "alerts" / "price_alerts.json"

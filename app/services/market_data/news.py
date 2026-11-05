@@ -56,7 +56,7 @@ def _load_finbert():
     which was built for social-media text. Loading requires the
     `transformers`/`torch` packages and, on first use, a network fetch of
     model weights from Hugging Face — both optional, so we fail soft to
-    VADER if either is unavailable rather than crashing the app.
+    VADER if either is unavailable rather than crashing the .
     """
 
     global _FINBERT_PIPELINE, _FINBERT_LOAD_ATTEMPTED

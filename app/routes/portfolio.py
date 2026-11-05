@@ -7,13 +7,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
-from backend.app.database import database_available, session_scope
-from backend.app.models.orm import InstrumentTag
-from backend.app.routes.dependencies import require_permission
-from backend.app.schemas.roles import InstrumentRole
-from backend.app.schemas.workspace import HoldingActivityRequest, HoldingCloseRequest, OnboardingRequest, PortfolioNameRequest
-from backend.app.services.auth import AuthUser
-from backend.app.services.workspace.application import (
+from app.database import database_available, session_scope
+from app.models.orm import InstrumentTag
+from app.routes.dependencies import require_permission
+from app.schemas.roles import InstrumentRole
+from app.schemas.workspace import HoldingActivityRequest, HoldingCloseRequest, OnboardingRequest, PortfolioNameRequest
+from app.services.auth import AuthUser
+from app.services.workspace.application import (
     add_portfolio_activity,
     close_portfolio_holding,
     list_portfolio_activities,

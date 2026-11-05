@@ -5,17 +5,17 @@ import json
 import time
 from datetime import datetime, timezone
 
-from backend.app.services.workspace.alerts import (
+from app.services.workspace.alerts import (
     PORTFOLIO_ALERT_SYMBOL,
     evaluate_alerts,
     latest_alert_inputs,
     read_alerts,
     write_alerts,
 )
-from backend.app.services.market_data.data_sources import DATA_DIR, fetch_yahoo_history, fetch_yahoo_quote
-from backend.app.database import database_available, list_user_ids_with_instruments
-from backend.app.services.analysis.indicators import add_indicators
-from backend.app.services.workspace.watchlist_store import active_symbols, read_instrument_tags, trading_instruments
+from app.services.market_data.data_sources import DATA_DIR, fetch_yahoo_history, fetch_yahoo_quote
+from app.database import database_available, list_user_ids_with_instruments
+from app.services.analysis.indicators import add_indicators
+from app.services.workspace.watchlist_store import active_symbols, read_instrument_tags, trading_instruments
 
 
 SYNC_STATUS_PATH = DATA_DIR / "sync" / "last_run.json"

@@ -10,10 +10,10 @@ import yfinance as yf
 
 from sqlalchemy import select
 
-from backend.app.database import database_available, ensure_database, session_scope
-from backend.app.models.orm import AppUser, InstrumentTag, PortfolioAccount, PortfolioActivity
-from backend.app.schemas.roles import InstrumentRole
-from backend.app.services.workspace.alerts import (
+from app.database import database_available, ensure_database, session_scope
+from app.models.orm import AppUser, InstrumentTag, PortfolioAccount, PortfolioActivity
+from app.schemas.roles import InstrumentRole
+from app.services.workspace.alerts import (
     PORTFOLIO_ALERT_SYMBOL,
     create_alert,
     evaluate_alerts,
@@ -21,9 +21,10 @@ from backend.app.services.workspace.alerts import (
     read_alerts,
     write_alerts,
 )
-from backend.app.services.analysis.backtest import backtest_pullback_strategy, walk_forward_backtest
-from backend.app.services.analysis.advanced_trading import build_local_advanced_trading_indicator
-from backend.app.services.market_data.data_sources import (
+from app.services.analysis.backtest import backtest_pullback_strategy, walk_forward_backtest
+from app.services.analysis.advanced_trading import build_local_advanced_trading_indicator
+from app.services.analysis.deep_evidence import build_deep_evidence
+from app.services.market_data.data_sources import (
     days_until_earnings,
     fetch_earnings_calendar,
     fetch_yahoo_financial_statements,
@@ -34,14 +35,14 @@ from backend.app.services.market_data.data_sources import (
     merge_source_preference,
     read_watchlist,
 )
-from backend.app.services.analysis.indicators import add_indicators, correlation_matrix, price_volume_profile
-from backend.app.services.market_data.markets import DEFAULT_WATCHLISTS, EXCHANGES, benchmark_for_symbol, normalize_symbol
-from backend.app.services.analysis.ml_signal import latest_model_signal, walk_forward_validate
-from backend.app.services.market_data.news import fetch_news, news_sentiment_score
-from backend.app.services.analysis.risk import RISK_PROFILES, get_risk_profile, market_regime
-from backend.app.services.analysis.strategies import build_signal, strategy_table
-from backend.app.services.analysis.summary import build_focused_stock_brief
-from backend.app.services.workspace.watchlist_store import (
+from app.services.analysis.indicators import add_indicators, correlation_matrix, price_volume_profile
+from app.services.market_data.markets import DEFAULT_WATCHLISTS, EXCHANGES, benchmark_for_symbol, classify_symbol, normalize_symbol, session_state
+from app.services.analysis.ml_signal import latest_model_signal, walk_forward_validate
+from app.services.market_data.news import fetch_news, news_sentiment_score
+from app.services.analysis.risk import RISK_PROFILES, get_risk_profile, market_regime
+from app.services.analysis.strategies import build_signal, strategy_table
+from app.services.analysis.summary import build_focused_stock_brief
+from app.services.workspace.watchlist_store import (
     active_symbols,
     merge_instrument_tags,
     read_instrument_tags,
@@ -49,7 +50,7 @@ from backend.app.services.workspace.watchlist_store import (
     trading_instruments,
     write_instrument_tags,
 )
-from backend.app.services.workspace.alert_notifications import dispatch_alert_notifications
+from app.services.workspace.alert_notifications import dispatch_alert_notifications
 
 
 DEFAULT_PERIOD = "2y"
@@ -353,7 +354,7 @@ def search_market_allowed(market: str, selected: list[str]) -> bool:
     normalized = market.upper()
     if normalized in EXCHANGES:
         return normalized in selected
-    if normalized == "US":
+    if normalized in {"US", "CRYPTO", "TOKENIZED"}:
         return "NASDAQ" in selected or "NYSE" in selected
     return not selected
 
@@ -527,6 +528,16 @@ def focused_analysis_payload(
         macro_context,
         vix_status,
     )
+    deep_evidence = build_deep_evidence(
+        frame_to_records(frame),
+        json_safe(enriched_snapshot),
+        json_safe(financial_statements),
+        json_safe(earnings),
+        frame_to_records(news),
+        intent=intent,
+        strategy=strategy,
+        risk_profile=risk_profile_name,
+    )
 
     return {
         "ok": True,
@@ -534,7 +545,8 @@ def focused_analysis_payload(
         "sourceStatus": source_status,
         "snapshotStatus": f"{snapshot_status.source}: {snapshot_status.message}",
         "earningsStatus": f"{earnings_status.source}: {earnings_status.message}",
-        "latestQuote": json_safe(latest_quote),
+        "latestQuote": {**json_safe(latest_quote), **{key: value for key, value in price_date_context(latest_price_date(frame, normalized_symbol), normalized_symbol).items()}},
+        "marketMetadata": json_safe(classify_symbol(normalized_symbol)),
         "benchmark": {"symbol": benchmark_symbol, "name": benchmark_name},
         "history": frame_to_records(frame),
         "volumeProfile": frame_to_records(price_volume_profile(frame)),
@@ -552,6 +564,7 @@ def focused_analysis_payload(
         "macroContext": json_safe(macro_context),
         "featureEngineering": json_safe(feature_engineering),
         "dataSources": json_safe(data_sources),
+        "deepEvidence": json_safe(deep_evidence),
         "ml": json_safe(dataclass_to_dict(ml_signal)),
         "mlValidation": {
             **json_safe(ml_validation_summary),
@@ -812,21 +825,71 @@ def portfolio_payload(
         for symbol in active_symbols(rows)
     }
     portfolio = build_portfolio_table(trading_instruments(rows), histories, live_histories)
+    deep_analysis = portfolio_deep_analysis(trading_instruments(rows), refresh=refresh)
     category = category_exposure_table(portfolio)
     watchlist = build_watchlist_table(rows, histories, live_histories)
     account = portfolio_account_payload(store_user_id)
     execution_plans = portfolio_execution_plans(trading_instruments(rows), histories)
+    for plan in execution_plans:
+        evidence = deep_analysis.get(str(plan.get("symbol") or "").upper()) or {}
+        execution = evidence.get("execution") if isinstance(evidence, dict) and isinstance(evidence.get("execution"), dict) else {}
+        if execution:
+            plan["confirmation"] = execution.get("confirmation", [])
+            plan["invalidation"] = execution.get("invalidation", [])
+            plan["thesis"] = (evidence.get("thesis") or {}).get("adjustedConclusion") if isinstance(evidence.get("thesis"), dict) else None
     return {
         "account": account,
         "portfolio": frame_to_records(portfolio),
         "categoryExposure": frame_to_records(category),
         "watchlist": frame_to_records(watchlist),
         "activities": list_portfolio_activities(store_user_id),
-        "metrics": portfolio_metrics(portfolio),
-        "notes": portfolio_recommendations(portfolio, category, execution_plans),
+        "metrics": portfolio_metrics(portfolio, deep_analysis),
+        "notes": portfolio_recommendations(portfolio, category, execution_plans, deep_analysis),
         "executionPlans": execution_plans,
+        "deepAnalysis": deep_analysis,
         "advancedTradingIndicators": advanced_trading_indicators,
     }
+
+
+def portfolio_deep_analysis(
+    trading_rows: list[dict[str, object]],
+    *,
+    refresh: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """Build the ten-point evidence package for every active portfolio holding."""
+    result: dict[str, dict[str, Any]] = {}
+    for item in trading_rows:
+        symbol = str(item.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        history, _history_status = load_analysis_frame(symbol, period="5y", interval="1d", refresh=refresh)
+        if history.empty:
+            result[symbol] = build_deep_evidence([], intent=str(item.get("intent") or "Hold / Watch"), strategy=str(item.get("strategy") or "Buy-dip"))
+            continue
+        snapshot, _snapshot_status = fetch_yahoo_snapshot(symbol, refresh=refresh)
+        latest_quote = latest_market_record(symbol, refresh=False)
+        snapshot = snapshot_with_latest_quote(snapshot, latest_quote)
+        company_name = str(snapshot.get("longName") or snapshot.get("shortName") or "")
+        news = fetch_news(symbol, company_name=company_name, refresh=refresh)
+        earnings, _earnings_status = fetch_earnings_calendar(symbol, refresh=refresh)
+        statements, _statements_status = fetch_yahoo_financial_statements(symbol, refresh=refresh)
+        result[symbol] = json_safe(build_deep_evidence(
+            frame_to_records(history),
+            snapshot,
+            statements,
+            earnings,
+            frame_to_records(news),
+            {
+                "shares": item.get("shares"),
+                "averageCost": item.get("average_cost"),
+                "bookCost": item.get("book_cost"),
+                "category": item.get("category"),
+            },
+            intent=str(item.get("intent") or "Hold / Watch"),
+            strategy=str(item.get("strategy") or "Buy-dip"),
+            risk_profile="Balanced",
+        ))
+    return result
 
 
 def portfolio_account_payload(user_id: str | None) -> dict[str, Any] | None:
@@ -1173,17 +1236,114 @@ def symbol_exists(symbol: str) -> bool:
 
 
 def market_for_symbol(symbol: str) -> str:
-    cleaned = _clean_symbol(symbol)
-    if cleaned.endswith(".TO") or cleaned.endswith(".V"):
-        return "TSX"
-    for market in ("NASDAQ", "NYSE"):
-        if cleaned in DEFAULT_WATCHLISTS.get(market, ()):
-            return market
-    return "US"
+    """Return the market label for a ticker (TSX, NASDAQ, NYSE, US, CRYPTO, TOKENIZED, FX, INDEX, OTHER)."""
+
+    return str(classify_symbol(_clean_symbol(symbol))["market"])
 
 
 def currency_for_symbol(symbol: str) -> str:
-    return "CAD" if market_for_symbol(symbol) == "TSX" else "USD"
+    """Return the settlement currency using the cached Yahoo snapshot when available."""
+
+    cleaned = _clean_symbol(symbol)
+    cached = _snapshot_currency(cleaned)
+    if cached:
+        return cached
+    return str(classify_symbol(cleaned)["currency"])
+
+
+_SNAPSHOT_CURRENCY_CACHE: dict[str, str] = {}
+
+
+def _snapshot_currency(symbol: str) -> str | None:
+    """Read the provider-reported currency from the local snapshot cache (no network)."""
+
+    if not symbol:
+        return None
+    if symbol in _SNAPSHOT_CURRENCY_CACHE:
+        return _SNAPSHOT_CURRENCY_CACHE[symbol] or None
+    from app.services.market_data.data_sources import _snapshot_cache_path
+
+    currency = ""
+    try:
+        cache_path = _snapshot_cache_path(symbol)
+        if cache_path.exists():
+            import json as _json
+
+            payload = _json.loads(cache_path.read_text(encoding="utf-8"))
+            value = str(payload.get("currency") or "").strip().upper()
+            if len(value) == 3 and value.isalpha():
+                currency = value
+    except Exception:
+        currency = ""
+    _SNAPSHOT_CURRENCY_CACHE[symbol] = currency
+    return currency or None
+
+
+def price_date_context(price_date: str, symbol: str) -> dict[str, Any]:
+    """Describe a quote timestamp for every supported market and currency.
+
+    The UTC timestamp is the anchor. The exchange timezone and the local time
+    in that zone let the UI show "10:42 EDT / 14:42 UTC" for TSX, NASDAQ, and
+    NYSE listings, while continuously traded tokenized ``-USD`` and crypto
+    instruments are flagged so a weekend or overnight timestamp is not
+    mistaken for stale data.
+    """
+
+    info = classify_symbol(_clean_symbol(symbol))
+    market_tz = str(info["timezone"])
+    parsed = parse_market_time(price_date) if price_date else None
+    local_iso = ""
+    if parsed is not None:
+        try:
+            from zoneinfo import ZoneInfo
+
+            local_iso = parsed.astimezone(ZoneInfo(market_tz)).isoformat()
+        except Exception:
+            local_iso = parsed.astimezone(timezone.utc).isoformat()
+    return {
+        "Price Date": price_date,
+        "Price Timezone": "UTC",
+        "Market Timezone": market_tz,
+        "Market Local Time": local_iso,
+        "Market Session": session_state(_clean_symbol(symbol), parsed) if parsed is not None else "unknown",
+        "Trades Continuously": bool(info["tradesContinuously"]),
+        "Asset Class": str(info["assetClass"]),
+    }
+
+
+def quotes_payload(symbols: list[str], refresh: bool = False) -> dict[str, Any]:
+    """Return the freshest price per symbol with the same timestamp context as the tables."""
+
+    quotes: list[dict[str, Any]] = []
+    for raw_symbol in symbols[:20]:
+        symbol = _clean_symbol(raw_symbol)
+        if not symbol:
+            continue
+        record = latest_market_record(symbol, refresh=refresh)
+        price = _finite_float(record.get("Close"))
+        price_date = ""
+        parsed = parse_market_time(record.get("Date"))
+        if parsed is not None:
+            price_date = parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        context = price_date_context(price_date, symbol)
+        quotes.append(
+            {
+                "symbol": symbol,
+                "price": price,
+                "market": market_for_symbol(symbol),
+                "currency": currency_for_symbol(symbol),
+                "source": record.get("source"),
+                "fetchedAt": record.get("fetchedAt"),
+                "priceDate": context["Price Date"],
+                "priceTimezone": context["Price Timezone"],
+                "marketTimezone": context["Market Timezone"],
+                "marketLocalTime": context["Market Local Time"],
+                "marketSession": context["Market Session"],
+                "tradesContinuously": context["Trades Continuously"],
+                "assetClass": context["Asset Class"],
+            }
+        )
+    return {"quotes": quotes, "generatedAt": datetime.now(timezone.utc).isoformat()}
 
 
 def dedupe_instruments(rows: Any) -> list[dict[str, Any]]:
@@ -1341,8 +1501,7 @@ def build_portfolio_table(
                 "Avg Cost": average_cost,
                 "Book Cost": book_cost,
                 "Current Price": price,
-                "Price Date": price_date,
-                "Price Timezone": "UTC",
+                **price_date_context(price_date, symbol),
                 "Market Value": market_value,
                 "Portfolio %": 0.0,
                 "Today $": today_dollars,
@@ -1391,8 +1550,7 @@ def build_watchlist_table(
                 "Intent": str(item.get("intent") or "Hold / Watch"),
                 "Strategy": str(item.get("strategy") or "Buy-dip"),
                 "Current Price": current,
-                "Price Date": price_date,
-                "Price Timezone": "UTC",
+                **price_date_context(price_date, symbol),
                 "Today %": current / prev - 1 if current == current and prev == prev and prev > 0 else float("nan"),
                 "Week %": current / week - 1 if current == current and week == week and week > 0 else float("nan"),
                 "Trend": watchlist_trend(pricing_frame),
@@ -1415,7 +1573,18 @@ def portfolio_trend(frame: pd.DataFrame, shares: float, points: int = 18) -> lis
     return [float(value) * shares for value in values]
 
 
-def portfolio_metrics(portfolio: pd.DataFrame) -> dict[str, Any]:
+def portfolio_metrics(portfolio: pd.DataFrame, deep_analysis: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+    deep_analysis = deep_analysis or {}
+    estimated_income = sum(
+        _safe_nonnegative((evidence.get("incomeAndCapitalPreservation") or {}).get("estimatedAnnualIncome"))
+        for evidence in deep_analysis.values()
+        if isinstance(evidence, dict)
+    )
+    capital_watch_count = sum(
+        1 for evidence in deep_analysis.values()
+        if isinstance(evidence, dict)
+        and str((evidence.get("incomeAndCapitalPreservation") or {}).get("capitalPreservationStatus") or "").startswith("price loss")
+    )
     currency = portfolio_currency(portfolio)
     if portfolio.empty:
         return {
@@ -1426,6 +1595,8 @@ def portfolio_metrics(portfolio: pd.DataFrame) -> dict[str, Any]:
             "todayPl": 0.0,
             "weekPl": 0.0,
             "currency": currency,
+            "estimatedAnnualIncome": estimated_income,
+            "capitalPreservationWatchCount": capital_watch_count,
         }
     total_book = float(portfolio["Book Cost"].sum())
     total_market = float(portfolio["Market Value"].sum())
@@ -1438,6 +1609,8 @@ def portfolio_metrics(portfolio: pd.DataFrame) -> dict[str, Any]:
         "todayPl": float(portfolio["Today $"].fillna(0).sum()),
         "weekPl": float(portfolio["Week $"].fillna(0).sum()),
         "currency": currency,
+        "estimatedAnnualIncome": estimated_income,
+        "capitalPreservationWatchCount": capital_watch_count,
     }
 
 
@@ -1552,8 +1725,10 @@ def portfolio_recommendations(
     portfolio: pd.DataFrame,
     category: pd.DataFrame,
     execution_plans: list[dict[str, Any]] | None = None,
+    deep_analysis: dict[str, dict[str, Any]] | None = None,
 ) -> list[str]:
     notes: list[str] = []
+    deep_analysis = deep_analysis or {}
     if portfolio.empty:
         return ["No trading holdings were entered yet."]
     largest = portfolio.iloc[0]
@@ -1574,6 +1749,15 @@ def portfolio_recommendations(
         notes.append(f"Portfolio is down ${abs(day_loss):,.2f} today; check whether the loss is broad-based or concentrated.")
     elif day_loss > 0:
         notes.append(f"Portfolio is up ${day_loss:,.2f} today; check whether the gain is broad-based or driven by one position.")
+    for symbol, evidence in list(deep_analysis.items())[:3]:
+        if not isinstance(evidence, dict):
+            continue
+        thesis = evidence.get("thesis") if isinstance(evidence.get("thesis"), dict) else {}
+        income = evidence.get("incomeAndCapitalPreservation") if isinstance(evidence.get("incomeAndCapitalPreservation"), dict) else {}
+        if thesis.get("classification"):
+            notes.append(f"{symbol} role: {thesis['classification']}.")
+        if str(income.get("capitalPreservationStatus") or "").startswith("price loss"):
+            notes.append(f"{symbol} has recorded price loss not offset by estimated income; review capital preservation before adding risk.")
     high_impact_plans = [
         plan
         for plan in (execution_plans or [])

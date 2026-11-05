@@ -4,13 +4,13 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, status
 
-from backend.app.routes.dependencies import optional_user
-from backend.app.schemas.workspace import InstrumentRequest, OnboardingRequest
-from backend.app.services.auth import AuthUser
-from backend.app.services.workspace.application import save_instruments, save_onboarding, workspace_payload
-from backend.app.services.workspace.application import portfolio_payload
-from backend.app.services.workspace.refresh_service import register_guest_symbols
-from backend.app.services.workspace.watchlist_store import active_symbols
+from app.routes.dependencies import optional_user
+from app.schemas.workspace import InstrumentRequest, OnboardingRequest
+from app.services.auth import AuthUser
+from app.services.workspace.application import save_instruments, save_onboarding, workspace_payload
+from app.services.workspace.application import portfolio_payload
+from app.services.workspace.refresh_service import register_guest_symbols
+from app.services.workspace.watchlist_store import active_symbols
 
 
 router = APIRouter(prefix="/api", tags=["workspace"])

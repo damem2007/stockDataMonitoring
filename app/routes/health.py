@@ -4,7 +4,7 @@ from typing import Any
 
 from fastapi import APIRouter
 
-from backend.app.database import database_status, ensure_database
+from app.database import database_status, ensure_database
 
 
 router = APIRouter(prefix="/api", tags=["health"])

@@ -4,10 +4,10 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends
 
-from backend.app.routes.dependencies import optional_user
-from backend.app.schemas.workspace import AlertListRequest, AlertRequest
-from backend.app.services.auth import AuthUser
-from backend.app.services.workspace.application import (
+from app.routes.dependencies import optional_user
+from app.schemas.workspace import AlertListRequest, AlertRequest
+from app.services.auth import AuthUser
+from app.services.workspace.application import (
     alerts_payload,
     create_alert_payload,
     delete_alert_payload,

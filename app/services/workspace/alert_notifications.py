@@ -5,9 +5,9 @@ from typing import Any
 
 from sqlalchemy import select
 
-from backend.app.database import database_available, ensure_database, session_scope
-from backend.app.models.orm import AppUser
-from backend.app.services.email_service import send_email, send_sms
+from app.database import database_available, ensure_database, session_scope
+from app.models.orm import AppUser
+from app.services.email_service import send_email, send_sms
 
 
 def dispatch_alert_notifications(user_id: str | None, triggered: list[dict[str, Any]]) -> list[dict[str, Any]]:

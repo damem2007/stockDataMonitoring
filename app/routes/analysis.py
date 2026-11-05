@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from backend.app.routes.dependencies import require_user
-from backend.app.services.analysis.market_explorer import (
+from app.routes.dependencies import optional_user, require_user
+from app.services.analysis.market_explorer import (
     delete_saved_market_explorer_analysis,
     list_saved_market_explorer_analyses,
     market_explorer_flow_payload,
@@ -13,10 +13,11 @@ from backend.app.services.analysis.market_explorer import (
     refresh_saved_market_explorer_analysis,
     save_market_explorer_analysis,
 )
-from backend.app.services.analysis.instrument_ai import enhance_instrument_analysis
-from backend.app.services.analysis.advanced_trading import build_advanced_trading_indicator
-from backend.app.services.auth import AuthUser
-from backend.app.services.workspace.application import correlation_payload, focused_analysis_payload
+from app.services.analysis.consultant_jobs import job_snapshot, start_consultant_job
+from app.services.analysis.instrument_ai import enhance_instrument_analysis
+from app.services.analysis.advanced_trading import build_advanced_trading_indicator
+from app.services.auth import AuthUser
+from app.services.workspace.application import correlation_payload, focused_analysis_payload
 
 
 router = APIRouter(prefix="/api", tags=["analysis"])
@@ -82,6 +83,21 @@ def ai_market_explorer_flow() -> dict[str, Any]:
 @router.post("/ai-market-explorer/analyze")
 def ai_market_explorer_analyze(payload: dict[str, Any]) -> dict[str, Any]:
     return market_explorer_recommendation_payload(payload)
+
+
+@router.post("/ai-market-explorer/jobs")
+def start_ai_market_explorer_job(payload: dict[str, Any], user: Optional[AuthUser] = Depends(optional_user)) -> dict[str, Any]:
+    """Start the consultant analysis as a live job and return its first snapshot."""
+
+    return start_consultant_job(payload, user.id if user and not user.is_guest else None)
+
+
+@router.get("/ai-market-explorer/jobs/{job_id}")
+def ai_market_explorer_job(job_id: str, include_result: bool = True, user: Optional[AuthUser] = Depends(optional_user)) -> dict[str, Any]:
+    snapshot = job_snapshot(job_id, user.id if user and not user.is_guest else None, include_result=include_result)
+    if snapshot is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Analysis job was not found or has expired.")
+    return snapshot
 
 
 @router.get("/ai-market-explorer/saved")

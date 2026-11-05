@@ -68,7 +68,7 @@ def ensure_database(strict: bool = False) -> bool:
     if engine is None:
         return False
     try:
-        from backend.app.models.orm import (  # noqa: F401
+        from app.models.orm import (  # noqa: F401
             AccountVerificationToken,
             AppUser,
             InstrumentTag,
@@ -94,7 +94,7 @@ def ensure_database(strict: bool = False) -> bool:
 def list_user_ids_with_instruments() -> list[str]:
     if not ensure_database():
         return []
-    from backend.app.models.orm import InstrumentTag
+    from app.models.orm import InstrumentTag
 
     with session_scope() as session:
         rows = session.query(InstrumentTag.user_id).filter(InstrumentTag.active.is_(True)).distinct().all()

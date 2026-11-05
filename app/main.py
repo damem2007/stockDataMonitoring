@@ -9,21 +9,23 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from backend.app.database import ensure_database
-from backend.app.routes.account import router as account_router
-from backend.app.routes.alerts import router as alerts_router
-from backend.app.routes.analysis import router as analysis_router
-from backend.app.routes.auth import router as auth_router
-from backend.app.routes.health import router as health_router
-from backend.app.routes.markets import router as markets_router
-from backend.app.routes.portfolio import router as portfolio_router
-from backend.app.routes.predictions import router as predictions_router
-from backend.app.routes.workspace import router as workspace_router
-from backend.app.services.workspace.refresh_service import start_workspace_refresh_loop, stop_workspace_refresh_loop
+from app.database import ensure_database
+from app.routes.account import router as account_router
+from app.routes.ai import router as ai_router
+from app.routes.alerts import router as alerts_router
+from app.routes.analysis import router as analysis_router
+from app.routes.auth import router as auth_router
+from app.routes.health import router as health_router
+from app.routes.markets import router as markets_router
+from app.routes.portfolio import router as portfolio_router
+from app.routes.predictions import router as predictions_router
+from app.routes.workspace import router as workspace_router
+from app.services.ai.models import start_background_catalog_refresh
+from app.services.workspace.refresh_service import start_workspace_refresh_loop, stop_workspace_refresh_loop
 
 
 load_dotenv()
@@ -32,6 +34,7 @@ load_dotenv()
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     ensure_database()
+    start_background_catalog_refresh()
     refresh_task = await start_workspace_refresh_loop()
     try:
         yield
@@ -72,6 +75,7 @@ app.add_middleware(
 app.include_router(health_router)
 app.include_router(auth_router)
 app.include_router(account_router)
+app.include_router(ai_router)
 app.include_router(markets_router)
 app.include_router(workspace_router)
 app.include_router(portfolio_router)

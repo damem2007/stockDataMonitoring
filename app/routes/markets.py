@@ -4,7 +4,7 @@ from typing import Any
 
 from fastapi import APIRouter, Query
 
-from backend.app.services.workspace.application import markets_payload, ticker_search_payload
+from app.services.workspace.application import markets_payload, quotes_payload, ticker_search_payload
 
 
 router = APIRouter(prefix="/api", tags=["markets"])
@@ -22,3 +22,11 @@ def search_tickers(
 ) -> dict[str, Any]:
     selected_markets = [item.strip().upper() for item in markets.split(",") if item.strip()]
     return ticker_search_payload(q, selected_markets)
+
+
+@router.get("/quotes")
+def quotes(symbols: str = Query("", description="Comma-separated symbols"), refresh: bool = False) -> dict[str, Any]:
+    """Latest prices with UTC, exchange-local, and session context for every market."""
+
+    parsed = [item.strip().upper() for item in symbols.replace("\n", ",").split(",") if item.strip()]
+    return quotes_payload(parsed, refresh=refresh)

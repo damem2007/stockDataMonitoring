@@ -6,8 +6,8 @@ from datetime import date, datetime, timezone
 import numpy as np
 import pandas as pd
 
-from backend.app.services.analysis.indicators import detect_gap_zones
-from backend.app.services.analysis.risk import RiskProfile, get_risk_profile
+from app.services.analysis.indicators import detect_gap_zones
+from app.services.analysis.risk import RiskProfile, get_risk_profile
  
  
 @dataclass(frozen=True)
