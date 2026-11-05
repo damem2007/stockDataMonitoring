@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import tempfile
 import json
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -10,7 +12,14 @@ import yfinance as yf
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = ROOT / "data"
+
+IS_VERCEL = bool(os.getenv("VERCEL"))
+
+if IS_VERCEL:
+    DATA_DIR = Path(tempfile.gettempdir()) / "market_data_cache"
+else:
+    DATA_DIR = ROOT / "data"
+
 YAHOO_CACHE_DIR = DATA_DIR / "cache" / "yahoo"
 YAHOO_SNAPSHOT_CACHE_DIR = DATA_DIR / "cache" / "yahoo_snapshot"
 EARNINGS_CACHE_DIR = DATA_DIR / "cache" / "earnings"
