@@ -1,0 +1,106 @@
+# Application source code and migrations are tracked by default.
+# No blanket exclusion required.
+!app/
+!app/services/
+!app/services/analysis/
+!app/services/analysis/market_explorer.py
+!app/services/analysis/deep_evidence.py
+!app/services/market_data/
+!app/services/market_data/public_holidays.py
+!app/services/workspace/
+!app/services/workspace/alert_notifications.py
+!migrations/
+migrations/*
+app/data/cache/*
+!migrations/versions/
+migrations/versions/*
+!migrations/versions/003_public_holidays_and_alert_contacts.py
+!app/models/
+!app/models/orm.py
+!app/database.py
+!app/routes/
+!app/routes/analysis.py
+# ──────────────────────────────────────
+# Python
+# ──────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# ──────────────────────────────────────
+# Environment / secrets
+# ──────────────────────────────────────
+.env
+.env.*
+
+# Keep environment template
+!.env.example
+
+# ──────────────────────────────────────
+# Testing / coverage
+# ──────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# ──────────────────────────────────────
+# Type checking / linting
+# ──────────────────────────────────────
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+# ──────────────────────────────────────
+# Packaging / build
+# ──────────────────────────────────────
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ──────────────────────────────────────
+# Runtime files
+# ──────────────────────────────────────
+*.log
+logs/
+*.pid
+
+# ──────────────────────────────────────
+# Local databases
+# ──────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ──────────────────────────────────────
+# Local/cache market data
+# ──────────────────────────────────────
+data/cache/
+.cache/
+*.parquet
+
+# Keep directory placeholders if used
+!data/cache/.gitkeep
+
+# ──────────────────────────────────────
+# IDE / OS
+# ──────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db.env
+.env
+
+# Operating system
+.DS_Store
+Thumbs.db
